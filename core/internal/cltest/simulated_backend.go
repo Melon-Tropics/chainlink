@@ -52,7 +52,7 @@ func NewApplicationWithConfigAndKeyOnSimulatedBlockchain(
 	flagsAndDeps = append(flagsAndDeps, client)
 
 	app, appCleanup := NewApplicationWithConfigAndKey(t, tc, flagsAndDeps...)
-	err := app.Store.KeyStore.Unlock(Password)
+	err := app.KeyStore.Eth().Unlock(Password)
 	require.NoError(t, err)
 
 	return app, func() { appCleanup(); client.Close() }
@@ -164,7 +164,7 @@ func (c *SimulatedBackendClient) currentBlockNumber() *big.Int {
 	return c.b.Blockchain().CurrentBlock().Number()
 }
 
-var balanceOfABIString string = `[
+var balanceOfABIString = `[
   {
     "constant": true,
     "inputs": [
@@ -222,19 +222,6 @@ func (c *SimulatedBackendClient) GetLINKBalance(linkAddress common.Address, addr
 	panic("not implemented")
 }
 
-// SendRawTx sends a signed transaction to the transaction pool.
-func (c *SimulatedBackendClient) SendRawTx(txBytes []byte) (txHash common.Hash, err error) {
-	tx, err := utils.DecodeEthereumTx(hexutil.Encode(txBytes))
-	if err != nil {
-		logger.Errorf("could not deserialize transaction: %x", txBytes)
-		return common.Hash{}, errors.Wrapf(err, "while sending tx %x", txBytes)
-	}
-	if err = c.b.SendTransaction(context.Background(), &tx); err == nil {
-		c.b.Commit()
-	}
-	return tx.Hash(), err
-}
-
 // TransactionReceipt returns the transaction receipt for the given transaction hash.
 func (c *SimulatedBackendClient) TransactionReceipt(ctx context.Context, receipt common.Hash) (*types.Receipt, error) {
 	return c.b.TransactionReceipt(ctx, receipt)
@@ -268,7 +255,7 @@ func (c *SimulatedBackendClient) blockNumber(number interface{}) (blockNumber *b
 	panic("can never reach here")
 }
 
-func (c *SimulatedBackendClient) HeaderByNumber(ctx context.Context, n *big.Int) (*models.Head, error) {
+func (c *SimulatedBackendClient) HeadByNumber(ctx context.Context, n *big.Int) (*models.Head, error) {
 	if n == nil {
 		n = c.currentBlockNumber()
 	}
@@ -300,6 +287,10 @@ func (c *SimulatedBackendClient) PendingNonceAt(ctx context.Context, account com
 	return c.b.PendingNonceAt(ctx, account)
 }
 
+func (c *SimulatedBackendClient) NonceAt(ctx context.Context, account common.Address, blockNumber *big.Int) (uint64, error) {
+	return c.b.NonceAt(ctx, account, blockNumber)
+}
+
 func (c *SimulatedBackendClient) BalanceAt(ctx context.Context, account common.Address, blockNumber *big.Int) (*big.Int, error) {
 	return c.b.BalanceAt(ctx, account, blockNumber)
 }
@@ -320,6 +311,8 @@ func (h *headSubscription) Err() <-chan error { return h.subscription.Err() }
 
 // SubscribeToNewHeads registers a subscription for push notifications of new
 // blocks.
+// Note the sim's API only accepts types.Head so we have this goroutine
+// to convert those into models.Head.
 func (c *SimulatedBackendClient) SubscribeNewHead(
 	ctx context.Context,
 	channel chan<- *models.Head,
@@ -327,6 +320,8 @@ func (c *SimulatedBackendClient) SubscribeNewHead(
 	subscription := &headSubscription{close: make(chan struct{})}
 	ch := make(chan *types.Header)
 	go func() {
+		var lastHead *models.Head
+
 		for {
 			select {
 			case h := <-ch:
@@ -334,7 +329,15 @@ func (c *SimulatedBackendClient) SubscribeNewHead(
 				case nil:
 					channel <- nil
 				default:
-					channel <- &models.Head{Number: h.Number.Int64(), Hash: h.Hash(), ParentHash: h.ParentHash}
+					head := &models.Head{Number: h.Number.Int64(), Hash: h.Hash(), ParentHash: h.ParentHash, Parent: lastHead}
+					lastHead = head
+					select {
+					// In head tracker shutdown the heads reader is closed, so the channel <- head write
+					// may hang.
+					case channel <- head:
+					case <-subscription.close:
+						return
+					}
 				}
 			case <-subscription.close:
 				return
@@ -348,6 +351,10 @@ func (c *SimulatedBackendClient) SubscribeNewHead(
 			"simulated backend")
 	}
 	return subscription, err
+}
+
+func (c *SimulatedBackendClient) HeaderByNumber(ctx context.Context, n *big.Int) (*types.Header, error) {
+	return c.b.HeaderByNumber(ctx, n)
 }
 
 func (c *SimulatedBackendClient) SendTransaction(ctx context.Context, tx *types.Transaction) error {
@@ -418,6 +425,10 @@ func (c *SimulatedBackendClient) BatchCallContext(ctx context.Context, b []rpc.B
 
 func (c *SimulatedBackendClient) RoundRobinBatchCallContext(ctx context.Context, b []rpc.BatchElem) error {
 	return c.BatchCallContext(ctx, b)
+}
+
+func (c *SimulatedBackendClient) SuggestGasTipCap(ctx context.Context) (tipCap *big.Int, err error) {
+	return nil, nil
 }
 
 // Mine forces the simulated backend to produce a new block every 2 seconds

@@ -136,9 +136,9 @@ func TestJobRun_ForLogger(t *testing.T) {
 	jr.Payment = linkReward
 	logsBeforeCompletion := jr.ForLogger()
 	require.Len(t, logsBeforeCompletion, 8)
-	assert.Equal(t, logsBeforeCompletion[0], "job")
+	assert.Equal(t, logsBeforeCompletion[0], "jobID")
 	assert.Equal(t, logsBeforeCompletion[1], jr.JobSpecID.String())
-	assert.Equal(t, logsBeforeCompletion[2], "run")
+	assert.Equal(t, logsBeforeCompletion[2], "runID")
 	assert.Equal(t, logsBeforeCompletion[3], jr.ID.String())
 	assert.Equal(t, logsBeforeCompletion[4], "status")
 	assert.Equal(t, logsBeforeCompletion[5], jr.GetStatus())
@@ -174,7 +174,7 @@ func TestJobRun_ApplyOutput_CompletedWithNoTasksRemaining(t *testing.T) {
 
 	job := cltest.NewJobWithWebInitiator()
 	jobRun := cltest.NewJobRun(job)
-	jobRun.TaskRuns = []models.TaskRun{models.TaskRun{}}
+	jobRun.TaskRuns = []models.TaskRun{{}}
 
 	result := models.NewRunOutputComplete(models.JSON{})
 	jobRun.TaskRuns[0].ApplyOutput(result)

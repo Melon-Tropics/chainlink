@@ -3,10 +3,7 @@ package orm_test
 import (
 	"context"
 	"fmt"
-	"io"
 	"math/big"
-	"os"
-	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -16,8 +13,11 @@ import (
 	"github.com/smartcontractkit/chainlink/core/assets"
 	"github.com/smartcontractkit/chainlink/core/auth"
 	"github.com/smartcontractkit/chainlink/core/internal/cltest"
+	"github.com/smartcontractkit/chainlink/core/internal/cltest/heavyweight"
 	"github.com/smartcontractkit/chainlink/core/internal/mocks"
 	"github.com/smartcontractkit/chainlink/core/services"
+	"github.com/smartcontractkit/chainlink/core/services/bulletprooftxmanager"
+	"github.com/smartcontractkit/chainlink/core/services/postgres"
 	"github.com/smartcontractkit/chainlink/core/services/synchronization"
 	"github.com/smartcontractkit/chainlink/core/store/models"
 	"github.com/smartcontractkit/chainlink/core/store/orm"
@@ -116,16 +116,17 @@ func TestORM_ShowJobWithMultipleTasks(t *testing.T) {
 
 	job := cltest.NewJob()
 	job.Tasks = []models.TaskSpec{
-		models.TaskSpec{Type: models.MustNewTaskType("task1")},
-		models.TaskSpec{Type: models.MustNewTaskType("task2")},
-		models.TaskSpec{Type: models.MustNewTaskType("task3")},
-		models.TaskSpec{Type: models.MustNewTaskType("task4")},
+		{Type: models.MustNewTaskType("task1")},
+		{Type: models.MustNewTaskType("task2")},
+		{Type: models.MustNewTaskType("task3")},
+		{Type: models.MustNewTaskType("task4")},
 	}
 	assert.NoError(t, store.CreateJob(&job))
 
 	orm := store.ORM
 	retrievedJob, err := orm.FindJobSpec(job.ID)
-	assert.NoError(t, err)
+	require.NoError(t, err)
+	require.Len(t, retrievedJob.Tasks, 4)
 	assert.Equal(t, string(retrievedJob.Tasks[0].Type), "task1")
 	assert.Equal(t, string(retrievedJob.Tasks[1].Type), "task2")
 	assert.Equal(t, string(retrievedJob.Tasks[2].Type), "task3")
@@ -722,7 +723,7 @@ func TestORM_AnyJobWithType(t *testing.T) {
 	defer cleanup()
 
 	js := cltest.NewJobWithWebInitiator()
-	js.Tasks = []models.TaskSpec{models.TaskSpec{Type: models.MustNewTaskType("bridgetestname")}}
+	js.Tasks = []models.TaskSpec{{Type: models.MustNewTaskType("bridgetestname")}}
 	assert.NoError(t, store.CreateJob(&js))
 	found, err := store.AnyJobWithType("bridgetestname")
 	assert.NoError(t, err)
@@ -844,6 +845,7 @@ func TestORM_PendingBridgeType_alreadyCompleted(t *testing.T) {
 
 	store, cleanup := cltest.NewStore(t)
 	defer cleanup()
+	keyStore := cltest.NewKeyStore(t, store.DB)
 
 	_, bt := cltest.NewBridgeType(t)
 	require.NoError(t, store.CreateBridgeType(bt))
@@ -857,7 +859,7 @@ func TestORM_PendingBridgeType_alreadyCompleted(t *testing.T) {
 	pusher := new(mocks.StatsPusher)
 	pusher.On("PushNow").Return(nil)
 
-	executor := services.NewRunExecutor(store, pusher)
+	executor := services.NewRunExecutor(store, keyStore, pusher)
 	require.NoError(t, executor.Execute(run.ID))
 
 	cltest.WaitForJobRunStatus(t, store, run, models.RunStatusCompleted)
@@ -876,7 +878,7 @@ func TestORM_PendingBridgeType_success(t *testing.T) {
 	require.NoError(t, store.CreateBridgeType(bt))
 
 	job := cltest.NewJobWithWebInitiator()
-	job.Tasks = []models.TaskSpec{models.TaskSpec{Type: bt.Name}}
+	job.Tasks = []models.TaskSpec{{Type: bt.Name}}
 	assert.NoError(t, store.CreateJob(&job))
 
 	unfinishedRun := cltest.NewJobRun(job)
@@ -1099,9 +1101,8 @@ func TestBulkDeleteRuns(t *testing.T) {
 	var resultCount int64
 	var taskCount int64
 	var runCount int64
-	orm := store.ORM
 
-	err := orm.RawDBWithAdvisoryLock(func(db *gorm.DB) error {
+	err := store.ORM.RawDBWithAdvisoryLock(func(db *gorm.DB) error {
 		job := cltest.NewJobWithWebInitiator()
 		require.NoError(t, store.ORM.CreateJob(&job))
 
@@ -1109,7 +1110,7 @@ func TestBulkDeleteRuns(t *testing.T) {
 		// but none of the statuses
 		oldIncompleteRun := cltest.NewJobRun(job)
 		oldIncompleteRun.Result = models.RunResult{Data: cltest.JSONFromString(t, `{"result": 17}`)}
-		err := orm.CreateJobRun(&oldIncompleteRun)
+		err := store.ORM.CreateJobRun(&oldIncompleteRun)
 		require.NoError(t, err)
 		db.Model(&oldIncompleteRun).UpdateColumn("updated_at", cltest.ParseISO8601(t, "2018-01-01T00:00:00Z"))
 
@@ -1119,7 +1120,7 @@ func TestBulkDeleteRuns(t *testing.T) {
 		oldCompletedRun.TaskRuns[0].Status = models.RunStatusCompleted
 		oldCompletedRun.Result = models.RunResult{Data: cltest.JSONFromString(t, `{"result": 19}`)}
 		oldCompletedRun.SetStatus(models.RunStatusCompleted)
-		err = orm.CreateJobRun(&oldCompletedRun)
+		err = store.ORM.CreateJobRun(&oldCompletedRun)
 		require.NoError(t, err)
 		db.Model(&oldCompletedRun).UpdateColumn("updated_at", cltest.ParseISO8601(t, "2018-01-01T00:00:00Z"))
 
@@ -1128,7 +1129,7 @@ func TestBulkDeleteRuns(t *testing.T) {
 		newCompletedRun := cltest.NewJobRun(job)
 		newCompletedRun.Result = models.RunResult{Data: cltest.JSONFromString(t, `{"result": 23}`)}
 		newCompletedRun.SetStatus(models.RunStatusCompleted)
-		err = orm.CreateJobRun(&newCompletedRun)
+		err = store.ORM.CreateJobRun(&newCompletedRun)
 		require.NoError(t, err)
 		db.Model(&newCompletedRun).UpdateColumn("updated_at", cltest.ParseISO8601(t, "2018-01-30T00:00:00Z"))
 
@@ -1136,11 +1137,11 @@ func TestBulkDeleteRuns(t *testing.T) {
 		newIncompleteRun := cltest.NewJobRun(job)
 		newIncompleteRun.Result = models.RunResult{Data: cltest.JSONFromString(t, `{"result": 71}`)}
 		newIncompleteRun.SetStatus(models.RunStatusCompleted)
-		err = orm.CreateJobRun(&newIncompleteRun)
+		err = store.ORM.CreateJobRun(&newIncompleteRun)
 		require.NoError(t, err)
 		db.Model(&newIncompleteRun).UpdateColumn("updated_at", cltest.ParseISO8601(t, "2018-01-30T00:00:00Z"))
 
-		err = store.ORM.BulkDeleteRuns(&models.BulkDeleteRunRequest{
+		err = postgres.BulkDeleteRuns(store.DB, &models.BulkDeleteRunRequest{
 			Status:        []models.RunStatus{models.RunStatusCompleted},
 			UpdatedBefore: cltest.ParseISO8601(t, "2018-01-15T00:00:00Z"),
 		})
@@ -1156,158 +1157,115 @@ func TestBulkDeleteRuns(t *testing.T) {
 
 		err = db.Model(&models.RunResult{}).Count(&resultCount).Error
 		assert.NoError(t, err)
-		assert.Equal(t, 3, int(resultCount))
+		assert.Equal(t, 6, int(resultCount))
 
 		return nil
 	})
 	require.NoError(t, err)
 }
 
-func TestORM_KeysOrdersByCreatedAtAsc(t *testing.T) {
-	store, cleanup := cltest.NewStore(t)
-	defer cleanup()
-	orm := store.ORM
-
-	earlier := cltest.MustInsertRandomKey(t, store.DB)
-	later := cltest.MustInsertRandomKey(t, store.DB)
-
-	require.NoError(t, orm.CreateKeyIfNotExists(later))
-
-	keys, err := store.SendKeys()
-	require.NoError(t, err)
-
-	require.Len(t, keys, 2)
-
-	assert.Equal(t, keys[0].Address, earlier.Address)
-	assert.Equal(t, keys[1].Address, later.Address)
-}
-
-func TestORM_SendKeys(t *testing.T) {
-	store, cleanup := cltest.NewStore(t)
-	defer cleanup()
-
-	cltest.MustInsertRandomKey(t, store.DB, false)
-	cltest.MustInsertRandomKey(t, store.DB, true)
-
-	keys, err := store.AllKeys()
-	require.NoError(t, err)
-	require.Len(t, keys, 2)
-
-	keys, err = store.SendKeys()
-	require.NoError(t, err)
-	require.Len(t, keys, 1)
-}
-
-func TestORM_SyncDbKeyStoreToDisk(t *testing.T) {
-	store, cleanup := cltest.NewStore(t)
-	defer cleanup()
-	require.NoError(t, store.KeyStore.Unlock(cltest.Password))
-
-	orm := store.ORM
-
-	dbkeys, err := store.SendKeys()
-	require.NoError(t, err)
-	require.Len(t, dbkeys, 0)
-
-	seed, err := models.NewKeyFromFile(fmt.Sprintf("../../internal/fixtures/keys/%s", cltest.DefaultKeyFixtureFileName))
-	require.NoError(t, err)
-	require.NoError(t, orm.CreateKeyIfNotExists(seed))
-
-	keysDir := store.Config.KeysDir()
-
-	require.True(t, isDirEmpty(t, keysDir))
-	err = orm.ClobberDiskKeyStoreWithDBKeys(keysDir)
-	require.NoError(t, err)
-
-	dbkeys, err = store.SendKeys()
-	require.NoError(t, err)
-	require.Len(t, dbkeys, 1)
-
-	diskkeys, err := utils.FilesInDir(keysDir)
-	require.NoError(t, err)
-	require.Len(t, diskkeys, 1)
-
-	key := dbkeys[0]
-	content, err := utils.FileContents(filepath.Join(keysDir, diskkeys[0]))
-	require.NoError(t, err)
-	assert.Equal(t, key.JSON.String(), content)
-}
-
 const linkEthTxWithTaskRunQuery = `
 INSERT INTO eth_task_run_txes (task_run_id, eth_tx_id) VALUES (?, ?)
 `
 
-func TestORM_RemoveUnstartedTransaction(t *testing.T) {
-	storeInstance, cleanup := cltest.NewStore(t)
+func TestORM_RemoveUnstartedTransaction_RemoveByEthTx(t *testing.T) {
+	store, cleanup := cltest.NewStore(t)
 	defer cleanup()
-	ormInstance := storeInstance.ORM
 
 	jobSpec := cltest.NewJobWithRunLogInitiator()
-	require.NoError(t, storeInstance.CreateJob(&jobSpec))
+	require.NoError(t, store.CreateJob(&jobSpec))
 
-	for _, status := range []models.RunStatus{
-		"in_progress",
-		"unstarted",
-	} {
-		jobRun := cltest.NewJobRun(jobSpec)
-		jobRun.Status = status
-		jobRun.TaskRuns = []models.TaskRun{
-			{
-				ID:         uuid.NewV4(),
-				Status:     models.RunStatusUnstarted,
-				TaskSpecID: jobSpec.Tasks[0].ID,
-			},
-		}
-		runRequest := models.NewRunRequest(models.JSON{})
-		require.NoError(t, storeInstance.DB.Create(&runRequest).Error)
-		jobRun.RunRequest = *runRequest
-		require.NoError(t, storeInstance.CreateJobRun(&jobRun))
+	runRequest := models.NewRunRequest(models.JSON{})
+	require.NoError(t, store.DB.Create(runRequest).Error)
+	unstartedJobRun := cltest.NewJobRun(jobSpec)
+	unstartedJobRun.RunRequest = *runRequest
+	unstartedJobRun.Status = models.RunStatusInProgress
+	require.NoError(t, store.CreateJobRun(&unstartedJobRun))
 
-		key := cltest.MustInsertRandomKey(t, storeInstance.DB)
-		ethTx := cltest.NewEthTx(t, storeInstance, key.Address.Address())
-		ethTx.State = models.EthTxState(status)
-		if status == "in_progress" {
-			var nonce int64 = 1
-			ethTx.Nonce = &nonce
-		}
-		require.NoError(t, storeInstance.DB.Save(&ethTx).Error)
+	runRequest = models.NewRunRequest(models.JSON{})
+	require.NoError(t, store.DB.Create(runRequest).Error)
+	startedJobRun := cltest.NewJobRun(jobSpec)
+	startedJobRun.RunRequest = *runRequest
+	startedJobRun.Status = models.RunStatusInProgress
+	require.NoError(t, store.CreateJobRun(&startedJobRun))
 
-		ethTxAttempt := cltest.NewEthTxAttempt(t, ethTx.ID)
-		ethTxAttempt.State = models.EthTxAttemptInProgress
-		require.NoError(t, storeInstance.DB.Save(&ethTxAttempt).Error)
+	key := cltest.MustInsertRandomKey(t, store.DB)
+	ethTx := cltest.NewEthTx(t, store, key.Address.Address())
+	require.NoError(t, store.DB.Create(&ethTx).Error)
 
-		require.NoError(t, storeInstance.DB.Exec(linkEthTxWithTaskRunQuery, jobRun.TaskRuns[0].ID, ethTx.ID).Error)
-	}
+	ethTxAttempt := cltest.NewEthTxAttempt(t, ethTx.ID)
+	require.NoError(t, store.DB.Create(&ethTxAttempt).Error)
+	require.NoError(t, store.DB.Exec(linkEthTxWithTaskRunQuery, unstartedJobRun.TaskRuns[0].ID, ethTx.ID).Error)
 
-	assert.NoError(t, ormInstance.RemoveUnstartedTransactions())
+	assert.NoError(t, store.RemoveUnstartedTransactions())
 
-	jobRuns, err := ormInstance.JobRunsFor(jobSpec.ID, 10)
-	assert.NoError(t, err)
-	assert.Len(t, jobRuns, 1, "expected only one JobRun to be left in the db")
-	assert.Equal(t, jobRuns[0].Status, models.RunStatusInProgress)
+	jobRuns, err := store.JobRunsFor(jobSpec.ID, 10)
+	require.NoError(t, err)
+	require.Len(t, jobRuns, 1, "expected only one JobRun to be left in the db")
+	assert.Equal(t, models.RunStatusInProgress, jobRuns[0].Status)
 
 	taskRuns := []models.TaskRun{}
-	assert.NoError(t, storeInstance.DB.Find(&taskRuns).Error)
+	require.NoError(t, store.DB.Find(&taskRuns).Error)
 	assert.Len(t, taskRuns, 1, "expected only one TaskRun to be left in the db")
 
 	runRequests := []models.RunRequest{}
-	assert.NoError(t, storeInstance.DB.Find(&runRequests).Error)
-	assert.Len(t, runRequests, 1, "expected only one RunRequest to be left in the db")
+	require.NoError(t, store.DB.Find(&runRequests).Error)
+	assert.Len(t, runRequests, 1, "expected only one RunRequests to be left in the db")
 
-	ethTxes := []models.EthTx{}
-	assert.NoError(t, storeInstance.DB.Find(&ethTxes).Error)
+	ethTxes := []bulletprooftxmanager.EthTx{}
+	require.NoError(t, store.DB.Find(&ethTxes).Error)
 	assert.Len(t, ethTxes, 1, "expected only one EthTx to be left in the db")
 
-	ethTxAttempts := []models.EthTxAttempt{}
-	assert.NoError(t, storeInstance.DB.Find(&ethTxAttempts).Error)
+	ethTxAttempts := []bulletprooftxmanager.EthTxAttempt{}
+	require.NoError(t, store.DB.Find(&ethTxAttempts).Error)
 	assert.Len(t, ethTxAttempts, 1, "expected only one EthTxAttempt to be left in the db")
+}
+
+func TestORM_RemoveUnstartedTransaction_RemoveByJobRun(t *testing.T) {
+	store, cleanup := cltest.NewStore(t)
+	defer cleanup()
+
+	jobSpec := cltest.NewJobWithRunLogInitiator()
+	require.NoError(t, store.CreateJob(&jobSpec))
+
+	runRequest := models.NewRunRequest(models.JSON{})
+	require.NoError(t, store.DB.Create(runRequest).Error)
+
+	unstartedJobRun := cltest.NewJobRun(jobSpec)
+	unstartedJobRun.RunRequest = *runRequest
+	unstartedJobRun.Status = models.RunStatusUnstarted
+	require.NoError(t, store.CreateJobRun(&unstartedJobRun))
+
+	runRequest = models.NewRunRequest(models.JSON{})
+	require.NoError(t, store.DB.Create(runRequest).Error)
+
+	startedJobRun := cltest.NewJobRun(jobSpec)
+	startedJobRun.RunRequest = *runRequest
+	startedJobRun.Status = models.RunStatusInProgress
+	require.NoError(t, store.CreateJobRun(&startedJobRun))
+
+	assert.NoError(t, store.RemoveUnstartedTransactions())
+
+	jobRuns, err := store.JobRunsFor(jobSpec.ID, 10)
+	require.NoError(t, err)
+	require.Len(t, jobRuns, 1, "expected only one JobRun to be left in the db")
+	assert.Equal(t, models.RunStatusInProgress, jobRuns[0].Status)
+
+	taskRuns := []models.TaskRun{}
+	require.NoError(t, store.DB.Find(&taskRuns).Error)
+	assert.Len(t, taskRuns, 1, "expected only one TaskRun to be left in the db")
+
+	runRequests := []models.RunRequest{}
+	require.NoError(t, store.DB.Find(&runRequests).Error)
+	assert.Len(t, runRequests, 1, "expected only one RunRequest to be left in the db")
 }
 
 func TestORM_EthTransactionsWithAttempts(t *testing.T) {
 	store, cleanup := cltest.NewStore(t)
 	defer cleanup()
+	ethKeyStore := cltest.NewKeyStore(t, store.DB).Eth()
 
-	_, from := cltest.MustAddRandomKeyToKeystore(t, store, 0)
+	_, from := cltest.MustAddRandomKeyToKeystore(t, ethKeyStore, 0)
 
 	cltest.MustInsertConfirmedEthTxWithAttempt(t, store, 0, 1, from)        // tx1
 	tx2 := cltest.MustInsertConfirmedEthTxWithAttempt(t, store, 1, 2, from) // tx2
@@ -1315,18 +1273,18 @@ func TestORM_EthTransactionsWithAttempts(t *testing.T) {
 	// add 2nd attempt to tx2
 	blockNum := int64(3)
 	attempt := cltest.NewEthTxAttempt(t, tx2.ID)
-	attempt.State = models.EthTxAttemptBroadcast
+	attempt.State = bulletprooftxmanager.EthTxAttemptBroadcast
 	attempt.GasPrice = *utils.NewBig(big.NewInt(3))
 	attempt.BroadcastBeforeBlockNum = &blockNum
 	require.NoError(t, store.DB.Create(&attempt).Error)
 
 	// tx 3 has no attempts
 	tx3 := cltest.NewEthTx(t, store, from)
-	tx3.State = models.EthTxUnstarted
+	tx3.State = bulletprooftxmanager.EthTxUnstarted
 	tx3.FromAddress = from
 	require.NoError(t, store.DB.Save(&tx3).Error)
 
-	count, err := store.CountOf(models.EthTx{})
+	count, err := store.CountOf(bulletprooftxmanager.EthTx{})
 	require.NoError(t, err)
 	require.Equal(t, 3, count)
 
@@ -1368,23 +1326,6 @@ func TestORM_UpdateBridgeType(t *testing.T) {
 	foundbridge, err := store.FindBridge("UniqueName")
 	require.NoError(t, err)
 	require.Equal(t, updateBridge.URL, foundbridge.URL)
-}
-
-func isDirEmpty(t *testing.T, dir string) bool {
-	f, err := os.Open(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return true
-		}
-		t.Fatal(err)
-	}
-	defer f.Close()
-
-	if _, err = f.Readdirnames(1); err == io.EOF {
-		return true
-	}
-
-	return false
 }
 
 func TestJobs_All(t *testing.T) {
@@ -1454,7 +1395,7 @@ func TestJobs_SQLiteBatchSizeIntegrity(t *testing.T) {
 	require.NoError(t, store.CreateJob(&archivedJob))
 
 	jobs := []models.JobSpec{}
-	jobNumber := orm.BatchSize*2 + 1
+	jobNumber := int(postgres.BatchSize*2 + 1)
 	for i := 0; i < jobNumber; i++ {
 		job := cltest.NewJobWithFluxMonitorInitiator()
 		require.NoError(t, store.CreateJob(&job))
@@ -1546,6 +1487,11 @@ func TestORM_Heads_Chain(t *testing.T) {
 	// Returns error if hash has no matches
 	_, err = store.Chain(context.TODO(), cltest.NewHash(), 12)
 	require.Error(t, err)
+
+	t.Run("depth of 0 returns error", func(t *testing.T) {
+		_, err = store.Chain(context.TODO(), longestChainHeadHash, 0)
+		require.EqualError(t, err, "record not found")
+	})
 }
 
 func TestORM_Heads_IdempotentInsertHead(t *testing.T) {
@@ -1577,21 +1523,22 @@ func TestORM_EthTaskRunTx(t *testing.T) {
 
 	// NOTE: Must sidestep transactional tests since we rely on transaction
 	// rollback due to constraint violation for this function
-	tc, orm, cleanup := cltest.BootstrapThrowawayORM(t, "eth_task_run_transactions", true, true)
+	tc, orm, cleanup := heavyweight.FullTestORM(t, "eth_task_run_transactions", true, true)
 	defer cleanup()
 	store, cleanup := cltest.NewStoreWithConfig(t, tc)
 	store.ORM = orm
 	defer cleanup()
-	_, fromAddress := cltest.MustAddRandomKeyToKeystore(t, store)
+	ethKeyStore := cltest.NewKeyStore(t, store.DB).Eth()
+	_, fromAddress := cltest.MustAddRandomKeyToKeystore(t, ethKeyStore)
 
-	sharedTaskRunID := cltest.MustInsertTaskRun(t, store)
+	sharedTaskRunID, _ := cltest.MustInsertTaskRun(t, store)
 
 	t.Run("creates eth_task_run_transaction and eth_tx", func(t *testing.T) {
 		toAddress := cltest.NewAddress()
 		encodedPayload := []byte{0, 1, 2}
 		gasLimit := uint64(42)
 
-		err := store.IdempotentInsertEthTaskRunTx(sharedTaskRunID, fromAddress, toAddress, encodedPayload, gasLimit)
+		err := store.IdempotentInsertEthTaskRunTx(models.EthTxMeta{TaskRunID: sharedTaskRunID}, fromAddress, toAddress, encodedPayload, gasLimit)
 		require.NoError(t, err)
 
 		etrt, err := store.FindEthTaskRunTxByTaskRunID(sharedTaskRunID)
@@ -1604,10 +1551,10 @@ func TestORM_EthTaskRunTx(t *testing.T) {
 		assert.Equal(t, toAddress, etrt.EthTx.ToAddress)
 		assert.Equal(t, encodedPayload, etrt.EthTx.EncodedPayload)
 		assert.Equal(t, gasLimit, etrt.EthTx.GasLimit)
-		assert.Equal(t, models.EthTxUnstarted, etrt.EthTx.State)
+		assert.Equal(t, bulletprooftxmanager.EthTxUnstarted, etrt.EthTx.State)
 
 		// Do it again to test idempotence
-		err = store.IdempotentInsertEthTaskRunTx(sharedTaskRunID, fromAddress, toAddress, encodedPayload, gasLimit)
+		err = store.IdempotentInsertEthTaskRunTx(models.EthTxMeta{TaskRunID: sharedTaskRunID}, fromAddress, toAddress, encodedPayload, gasLimit)
 		require.NoError(t, err)
 
 		// Ensure it didn't leave a stray EthTx hanging around
@@ -1624,25 +1571,25 @@ func TestORM_EthTaskRunTx(t *testing.T) {
 		encodedPayload := []byte{3, 2, 1}
 		gasLimit := uint64(24)
 
-		err := store.IdempotentInsertEthTaskRunTx(sharedTaskRunID, fromAddress, toAddress, encodedPayload, gasLimit)
+		err := store.IdempotentInsertEthTaskRunTx(models.EthTxMeta{TaskRunID: sharedTaskRunID}, fromAddress, toAddress, encodedPayload, gasLimit)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "transaction already exists for task run ID")
 	})
 
 	t.Run("does not return error on re-insert if only the gas limit changed", func(t *testing.T) {
-		taskRunID := cltest.MustInsertTaskRun(t, store)
+		taskRunID, _ := cltest.MustInsertTaskRun(t, store)
 		toAddress := cltest.NewAddress()
 		encodedPayload := []byte{0, 1, 2}
 		firstGasLimit := uint64(42)
 
 		// First insert
-		err := store.IdempotentInsertEthTaskRunTx(taskRunID, fromAddress, toAddress, encodedPayload, firstGasLimit)
+		err := store.IdempotentInsertEthTaskRunTx(models.EthTxMeta{TaskRunID: taskRunID}, fromAddress, toAddress, encodedPayload, firstGasLimit)
 		require.NoError(t, err)
 
 		secondGasLimit := uint64(99)
 
 		// Second insert
-		err = store.IdempotentInsertEthTaskRunTx(taskRunID, fromAddress, toAddress, encodedPayload, secondGasLimit)
+		err = store.IdempotentInsertEthTaskRunTx(models.EthTxMeta{TaskRunID: taskRunID}, fromAddress, toAddress, encodedPayload, secondGasLimit)
 		require.NoError(t, err)
 
 		etrt, err := store.FindEthTaskRunTxByTaskRunID(taskRunID)
@@ -1650,6 +1597,17 @@ func TestORM_EthTaskRunTx(t *testing.T) {
 
 		// But the second insert did not change the gas limit
 		assert.Equal(t, firstGasLimit, etrt.EthTx.GasLimit)
+	})
+
+	t.Run("returns error if fromAddress does not correspond to a key", func(t *testing.T) {
+		taskRunID, _ := cltest.MustInsertTaskRun(t, store)
+		toAddress := cltest.NewAddress()
+		encodedPayload := []byte{0, 1, 2}
+		gasLimit := uint64(42)
+
+		err := store.IdempotentInsertEthTaskRunTx(models.EthTxMeta{TaskRunID: taskRunID}, cltest.NewAddress(), toAddress, encodedPayload, gasLimit)
+		assert.Error(t, err)
+		assert.EqualError(t, err, "ERROR: insert or update on table \"eth_txes\" violates foreign key constraint \"eth_txes_from_address_fkey\" (SQLSTATE 23503)")
 	})
 }
 
@@ -1884,61 +1842,6 @@ func TestORM_UpdateFluxMonitorRoundStats(t *testing.T) {
 		require.True(t, fmrs.JobRunID.Valid)
 		require.Equal(t, jobRun.ID, fmrs.JobRunID.UUID)
 	}
-}
-
-func TestORM_GetRoundRobinAddress(t *testing.T) {
-	t.Parallel()
-	store, cleanup := cltest.NewStore(t)
-	defer cleanup()
-
-	cltest.MustAddRandomKeyToKeystore(t, store, 0, true)
-	_, k0Address := cltest.MustAddRandomKeyToKeystore(t, store, 0)
-	k1, _ := cltest.MustAddRandomKeyToKeystore(t, store, 0)
-	k2, _ := cltest.MustAddRandomKeyToKeystore(t, store, 0)
-
-	t.Run("with no address filter, rotates between all addresses", func(t *testing.T) {
-		address, err := store.GetRoundRobinAddress()
-		require.NoError(t, err)
-		assert.Equal(t, k0Address.Hex(), address.Hex())
-
-		address, err = store.GetRoundRobinAddress()
-		require.NoError(t, err)
-		assert.Equal(t, k1.Address.Hex(), address.Hex())
-
-		address, err = store.GetRoundRobinAddress()
-		require.NoError(t, err)
-		assert.Equal(t, k2.Address.Hex(), address.Hex())
-
-		address, err = store.GetRoundRobinAddress()
-		require.NoError(t, err)
-		assert.Equal(t, k0Address.Hex(), address.Hex())
-	})
-
-	t.Run("with address filter, rotates between given addresses", func(t *testing.T) {
-		addresses := []common.Address{k1.Address.Address(), k2.Address.Address()}
-
-		address, err := store.GetRoundRobinAddress(addresses...)
-		require.NoError(t, err)
-		assert.Equal(t, k1.Address.Hex(), address.Hex())
-
-		address, err = store.GetRoundRobinAddress(addresses...)
-		require.NoError(t, err)
-		assert.Equal(t, k2.Address.Hex(), address.Hex())
-
-		address, err = store.GetRoundRobinAddress(addresses...)
-		require.NoError(t, err)
-		assert.Equal(t, k1.Address.Hex(), address.Hex())
-
-		address, err = store.GetRoundRobinAddress(addresses...)
-		require.NoError(t, err)
-		assert.Equal(t, k2.Address.Hex(), address.Hex())
-	})
-
-	t.Run("with address filter when no address matches", func(t *testing.T) {
-		_, err := store.GetRoundRobinAddress([]common.Address{cltest.NewAddress()}...)
-		require.Error(t, err)
-		require.Equal(t, "no keys available", err.Error())
-	})
 }
 
 func TestORM_SetConfigStrValue(t *testing.T) {

@@ -2,7 +2,7 @@
   "name": "@chainlink/belt",
   "private": false,
   "description": "A toolbelt for performing various commands on chainlink smart contracts.",
-  "version": "0.0.5-alpha.1",
+  "version": "0.0.6",
   "author": "Chainlink Devs",
   "bin": {
     "belt": "./bin/run"
@@ -19,7 +19,7 @@
   },
   "bugs": "https://github.com/smartcontractkit/chainlink/issues",
   "dependencies": {
-    "@0x/sol-compiler": "^4.0.8",
+    "@0x/sol-compiler": "4.0.8",
     "@oclif/command": "^1",
     "@oclif/config": "^1",
     "@oclif/plugin-help": "^3",
@@ -29,7 +29,7 @@
     "cli-ux": "^5.5.0",
     "debug": "^4.3.1",
     "ethers": "^4.0.45",
-    "inquirer": "^7.3.3",
+    "inquirer": "^8.1.0",
     "patch-package": "^6.4.7",
     "shelljs": "^0.8.3",
     "ts-generator": "^0.1.1",

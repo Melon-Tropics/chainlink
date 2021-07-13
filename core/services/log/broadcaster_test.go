@@ -3,26 +3,24 @@ package log_test
 import (
 	"context"
 	"math/big"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/onsi/gomega"
 	"github.com/smartcontractkit/chainlink/core/internal/cltest"
 	"github.com/smartcontractkit/chainlink/core/internal/gethwrappers/generated"
 	"github.com/smartcontractkit/chainlink/core/internal/gethwrappers/generated/flux_aggregator_wrapper"
 	"github.com/smartcontractkit/chainlink/core/internal/mocks"
 	"github.com/smartcontractkit/chainlink/core/logger"
+	httypes "github.com/smartcontractkit/chainlink/core/services/headtracker/types"
 	"github.com/smartcontractkit/chainlink/core/services/log"
-	logmocks "github.com/smartcontractkit/chainlink/core/services/log/mocks"
 	strpkg "github.com/smartcontractkit/chainlink/core/store"
 	"github.com/smartcontractkit/chainlink/core/store/models"
 	"github.com/smartcontractkit/chainlink/core/store/orm"
-
-	"github.com/ethereum/go-ethereum"
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -30,265 +28,324 @@ import (
 func TestBroadcaster_AwaitsInitialSubscribersOnStartup(t *testing.T) {
 	g := gomega.NewGomegaWithT(t)
 
-	store, cleanup := cltest.NewStore(t)
-	defer cleanup()
+	const blockHeight int64 = 123
+	helper := newBroadcasterHelper(t, blockHeight, 1)
+	helper.lb.AddDependents(2)
+	helper.start()
+	defer helper.stop()
 
-	const (
-		blockHeight int64 = 123
-	)
+	var listener = helper.newLogListener("A")
+	helper.register(listener, newMockContract(), 1)
 
-	var (
-		ethClient = new(mocks.Client)
-		sub       = new(mocks.Subscription)
-		listener  = new(logmocks.Listener)
-	)
-	store.EthClient = ethClient
+	require.Eventually(t, func() bool { return helper.mockEth.subscribeCallCount() == 0 }, 5*time.Second, 10*time.Millisecond)
+	g.Consistently(func() int32 { return helper.mockEth.subscribeCallCount() }).Should(gomega.Equal(int32(0)))
 
-	listener.On("JobID").Return(models.NewJobID())
-	listener.On("JobIDV2").Return(int32(123))
-	listener.On("IsV2Job").Return(true)
-	listener.On("OnConnect").Return()
-	listener.On("OnDisconnect").Return()
+	helper.lb.DependentReady()
 
-	sub.On("Unsubscribe").Maybe().Return()
-	sub.On("Err").Return(nil)
+	require.Eventually(t, func() bool { return helper.mockEth.subscribeCallCount() == 0 }, 5*time.Second, 10*time.Millisecond)
+	g.Consistently(func() int32 { return helper.mockEth.subscribeCallCount() }).Should(gomega.Equal(int32(0)))
 
-	chSubscribe := make(chan struct{}, 10)
-	ethClient.On("SubscribeFilterLogs", mock.Anything, mock.Anything, mock.Anything).
-		Return(sub, nil).
-		Run(func(mock.Arguments) { chSubscribe <- struct{}{} })
-	ethClient.On("HeaderByNumber", mock.Anything, (*big.Int)(nil)).Return(&models.Head{Number: blockHeight}, nil)
-	ethClient.On("FilterLogs", mock.Anything, mock.Anything).Return([]types.Log{}, nil)
+	helper.lb.DependentReady()
 
-	orm := log.NewORM(store.DB)
-	lb := log.NewBroadcaster(orm, store.EthClient, store.Config)
-	lb.AddDependents(2)
-	lb.Start()
-	defer lb.Stop()
+	require.Eventually(t, func() bool { return helper.mockEth.subscribeCallCount() == 1 }, 5*time.Second, 10*time.Millisecond)
+	g.Consistently(func() int32 { return helper.mockEth.subscribeCallCount() }).Should(gomega.Equal(int32(1)))
 
-	contract := new(logmocks.AbigenContract)
-	contract.On("Address").Return(common.Address{})
+	helper.unsubscribeAll()
 
-	_, unsubscribe := lb.Register(listener, log.ListenerOpts{
-		Contract: contract,
-		Logs: []generated.AbigenLog{
-			flux_aggregator_wrapper.FluxAggregatorNewRound{},
-			flux_aggregator_wrapper.FluxAggregatorAnswerUpdated{},
-		},
-	})
-	defer unsubscribe()
+	require.Eventually(t, func() bool { return helper.mockEth.unsubscribeCallCount() == 1 }, 5*time.Second, 10*time.Millisecond)
+	g.Consistently(func() int32 { return helper.mockEth.unsubscribeCallCount() }).Should(gomega.Equal(int32(1)))
 
-	g.Consistently(func() int { return len(chSubscribe) }).Should(gomega.Equal(0))
-	lb.DependentReady()
-	g.Consistently(func() int { return len(chSubscribe) }).Should(gomega.Equal(0))
-	lb.DependentReady()
-	g.Eventually(func() int { return len(chSubscribe) }).Should(gomega.Equal(1))
-	g.Consistently(func() int { return len(chSubscribe) }).Should(gomega.Equal(1))
-
-	cltest.EventuallyExpectationsMet(t, ethClient, 5*time.Second, 10*time.Millisecond)
-	cltest.EventuallyExpectationsMet(t, sub, 5*time.Second, 10*time.Millisecond)
+	helper.mockEth.assertExpectations(t)
 }
 
 func TestBroadcaster_ResubscribesOnAddOrRemoveContract(t *testing.T) {
 	t.Parallel()
 
-	store, cleanup := cltest.NewStore(t)
-	defer cleanup()
+	const (
+		numConfirmations            = 1
+		numContracts                = 3
+		blockHeight           int64 = 123
+		lastStoredBlockHeight       = blockHeight - 25
+	)
+
+	backfillTimes := 2
+	expectedCalls := mockEthClientExpectedCalls{
+		SubscribeFilterLogs: backfillTimes,
+		HeaderByNumber:      backfillTimes,
+		FilterLogs:          backfillTimes,
+	}
+
+	chchRawLogs := make(chan chan<- types.Log, backfillTimes)
+	mockEth := newMockEthClient(chchRawLogs, blockHeight, expectedCalls)
+	helper := newBroadcasterHelperWithEthClient(t, mockEth.ethClient, cltest.Head(lastStoredBlockHeight))
+	helper.mockEth = mockEth
+
+	blockBackfillDepth := helper.store.Config.BlockBackfillDepth()
+
+	var backfillCount int64
+	var backfillCountPtr = &backfillCount
+
+	// the first backfill should use the height of last head saved to the db,
+	// minus maxNumConfirmations of subscribers and minus blockBackfillDepth
+	mockEth.checkFilterLogs = func(fromBlock int64, toBlock int64) {
+		atomic.StoreInt64(backfillCountPtr, 1)
+		require.Equal(t, lastStoredBlockHeight-numConfirmations-int64(blockBackfillDepth), fromBlock)
+	}
+
+	listener := helper.newLogListener("initial")
+	helper.register(listener, newMockContract(), numConfirmations)
+	helper.start()
+
+	for i := 0; i < numContracts; i++ {
+		listener := helper.newLogListener("")
+		helper.register(listener, newMockContract(), 1)
+	}
+
+	require.Eventually(t, func() bool { return helper.mockEth.subscribeCallCount() == 1 }, 5*time.Second, 10*time.Millisecond)
+	gomega.NewGomegaWithT(t).Consistently(func() int32 { return helper.mockEth.subscribeCallCount() }).Should(gomega.Equal(int32(1)))
+	gomega.NewGomegaWithT(t).Consistently(func() int32 { return helper.mockEth.unsubscribeCallCount() }).Should(gomega.Equal(int32(0)))
+
+	require.Eventually(t, func() bool { return atomic.LoadInt64(backfillCountPtr) == 1 }, 5*time.Second, 10*time.Millisecond)
+	helper.unsubscribeAll()
+
+	// now the backfill must use the blockBackfillDepth
+	mockEth.checkFilterLogs = func(fromBlock int64, toBlock int64) {
+		require.Equal(t, blockHeight-int64(blockBackfillDepth), fromBlock)
+		atomic.StoreInt64(backfillCountPtr, 2)
+	}
+
+	listenerLast := helper.newLogListener("last")
+	helper.register(listenerLast, newMockContract(), 1)
+
+	require.Eventually(t, func() bool { return helper.mockEth.unsubscribeCallCount() >= 1 }, 5*time.Second, 10*time.Millisecond)
+	gomega.NewGomegaWithT(t).Consistently(func() int32 { return helper.mockEth.subscribeCallCount() }).Should(gomega.Equal(int32(2)))
+	gomega.NewGomegaWithT(t).Consistently(func() int32 { return helper.mockEth.unsubscribeCallCount() }).Should(gomega.Equal(int32(1)))
+
+	require.Eventually(t, func() bool { return atomic.LoadInt64(backfillCountPtr) == 2 }, 5*time.Second, 10*time.Millisecond)
+
+	helper.stop()
+	helper.mockEth.assertExpectations(t)
+}
+
+func TestBroadcaster_BackfillOnNodeStart(t *testing.T) {
+	t.Parallel()
 
 	const (
-		numContracts       = 3
-		blockHeight  int64 = 123
+		lastStoredBlockHeight       = 100
+		blockHeight           int64 = 125
 	)
 
-	var (
-		ethClient        = new(mocks.Client)
-		sub              = new(mocks.Subscription)
-		subscribeCalls   int32
-		unsubscribeCalls int32
+	backfillTimes := 1
+	expectedCalls := mockEthClientExpectedCalls{
+		SubscribeFilterLogs: backfillTimes,
+		HeaderByNumber:      backfillTimes,
+		FilterLogs:          backfillTimes,
+	}
+
+	chchRawLogs := make(chan chan<- types.Log, backfillTimes)
+	mockEth := newMockEthClient(chchRawLogs, blockHeight, expectedCalls)
+	helper := newBroadcasterHelperWithEthClient(t, mockEth.ethClient, cltest.Head(lastStoredBlockHeight))
+	helper.mockEth = mockEth
+
+	maxNumConfirmations := int64(10)
+
+	var backfillCount int64
+	var backfillCountPtr = &backfillCount
+
+	listener := helper.newLogListener("one")
+	helper.register(listener, newMockContract(), uint64(maxNumConfirmations))
+
+	listener2 := helper.newLogListener("two")
+	helper.register(listener2, newMockContract(), uint64(2))
+
+	blockBackfillDepth := helper.store.Config.BlockBackfillDepth()
+
+	// the first backfill should use the height of last head saved to the db,
+	// minus maxNumConfirmations of subscribers and minus blockBackfillDepth
+	mockEth.checkFilterLogs = func(fromBlock int64, toBlock int64) {
+		atomic.StoreInt64(backfillCountPtr, 1)
+		require.Equal(t, lastStoredBlockHeight-maxNumConfirmations-int64(blockBackfillDepth), fromBlock)
+	}
+
+	helper.start()
+
+	require.Eventually(t, func() bool { return helper.mockEth.subscribeCallCount() == 1 }, 5*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool { return atomic.LoadInt64(backfillCountPtr) == 1 }, 5*time.Second, 10*time.Millisecond)
+
+	helper.stop()
+
+	require.Eventually(t, func() bool { return helper.mockEth.unsubscribeCallCount() >= 1 }, 5*time.Second, 10*time.Millisecond)
+	helper.mockEth.assertExpectations(t)
+}
+
+func TestBroadcaster_BackfillInBatches(t *testing.T) {
+	t.Parallel()
+
+	const (
+		numConfirmations            = 1
+		blockHeight           int64 = 120
+		lastStoredBlockHeight       = blockHeight - 29
+		backfillTimes               = 1
+		batchSize             int64 = 5
+		expectedBatches             = 9
 	)
-	store.EthClient = ethClient
 
-	ethClient.On("SubscribeFilterLogs", mock.Anything, mock.Anything, mock.Anything).
-		Return(sub, nil).
-		Run(func(args mock.Arguments) {
-			atomic.AddInt32(&subscribeCalls, 1)
-		})
-	ethClient.On("HeaderByNumber", mock.Anything, (*big.Int)(nil)).Return(&models.Head{Number: blockHeight}, nil)
-	ethClient.On("FilterLogs", mock.Anything, mock.Anything).Return(nil, nil)
-	sub.On("Unsubscribe").
-		Return().
-		Run(func(mock.Arguments) { atomic.AddInt32(&unsubscribeCalls, 1) })
-	sub.On("Err").Return(nil)
-
-	orm := log.NewORM(store.DB)
-	lb := log.NewBroadcaster(orm, store.EthClient, store.Config)
-	lb.Start()
-	defer lb.Stop()
-
-	type registration struct {
-		log.AbigenContract
-		log.Listener
-	}
-	registrations := make([]registration, numContracts)
-	var unsubscribes []func()
-	for i := 0; i < numContracts; i++ {
-		contract := new(logmocks.AbigenContract)
-		contract.On("Address").Return(cltest.NewAddress())
-
-		listener := new(logmocks.Listener)
-		listener.On("OnConnect").Return()
-		listener.On("OnDisconnect").Return()
-		listener.On("JobID").Return(models.NewJobID())
-		listener.On("JobIDV2").Return(int32(i))
-		listener.On("IsV2Job").Return(i%2 == 0)
-		registrations[i] = registration{contract, listener}
-		_, unsubscribe := lb.Register(listener, log.ListenerOpts{
-			Contract: contract,
-			Logs: []generated.AbigenLog{
-				flux_aggregator_wrapper.FluxAggregatorNewRound{},
-				flux_aggregator_wrapper.FluxAggregatorAnswerUpdated{},
-			},
-		})
-		unsubscribes = append(unsubscribes, unsubscribe)
-		defer unsubscribe()
+	expectedCalls := mockEthClientExpectedCalls{
+		SubscribeFilterLogs: backfillTimes,
+		HeaderByNumber:      backfillTimes,
+		FilterLogs:          expectedBatches,
 	}
 
-	require.Eventually(t, func() bool { return atomic.LoadInt32(&subscribeCalls) == 1 }, 5*time.Second, 10*time.Millisecond)
-	gomega.NewGomegaWithT(t).Consistently(func() int32 { return atomic.LoadInt32(&subscribeCalls) }).Should(gomega.Equal(int32(1)))
-	gomega.NewGomegaWithT(t).Consistently(func() int32 { return atomic.LoadInt32(&unsubscribeCalls) }).Should(gomega.Equal(int32(0)))
+	chchRawLogs := make(chan chan<- types.Log, backfillTimes)
+	mockEth := newMockEthClient(chchRawLogs, blockHeight, expectedCalls)
+	helper := newBroadcasterHelperWithEthClient(t, mockEth.ethClient, cltest.Head(lastStoredBlockHeight))
+	helper.mockEth = mockEth
 
-	for _, unsub := range unsubscribes {
-		unsub()
+	blockBackfillDepth := helper.store.Config.BlockBackfillDepth()
+	helper.store.Config.Set(orm.EnvVarName("EthLogBackfillBatchSize"), batchSize)
+
+	var backfillCount int64
+	var backfillCountPtr = &backfillCount
+
+	backfillStart := lastStoredBlockHeight - numConfirmations - int64(blockBackfillDepth)
+	// the first backfill should start from before the last stored head
+	mockEth.checkFilterLogs = func(fromBlock int64, toBlock int64) {
+		times := atomic.LoadInt64(backfillCountPtr)
+		logger.Warnf("Log Batch: --------- times %v - %v, %v", times, fromBlock, toBlock)
+
+		if times <= 7 {
+			require.Equal(t, backfillStart+batchSize*times, fromBlock)
+			require.Equal(t, backfillStart+batchSize*(times+1)-1, toBlock)
+		} else {
+			// last batch is for a range of 1
+			require.Equal(t, int64(120), fromBlock)
+			require.Equal(t, int64(120), toBlock)
+		}
+		atomic.StoreInt64(backfillCountPtr, times+1)
 	}
-	require.Eventually(t, func() bool { return atomic.LoadInt32(&unsubscribeCalls) == 1 }, 5*time.Second, 10*time.Millisecond)
-	gomega.NewGomegaWithT(t).Consistently(func() int32 { return atomic.LoadInt32(&subscribeCalls) }).Should(gomega.Equal(int32(1)))
 
-	lb.Stop()
-	gomega.NewGomegaWithT(t).Consistently(func() int32 { return atomic.LoadInt32(&unsubscribeCalls) }).Should(gomega.Equal(int32(1)))
+	listener := helper.newLogListener("initial")
+	helper.register(listener, newMockContract(), numConfirmations)
+	helper.start()
 
-	ethClient.AssertExpectations(t)
-	sub.AssertExpectations(t)
+	defer helper.stop()
+
+	require.Eventually(t, func() bool { return atomic.LoadInt64(backfillCountPtr) == expectedBatches }, 5*time.Second, 10*time.Millisecond)
+
+	helper.unsubscribeAll()
+
+	require.Eventually(t, func() bool { return helper.mockEth.unsubscribeCallCount() >= 1 }, 5*time.Second, 10*time.Millisecond)
+
+	helper.mockEth.assertExpectations(t)
+}
+
+func TestBroadcaster_BackfillALargeNumberOfLogs(t *testing.T) {
+	t.Parallel()
+
+	const (
+		lastStoredBlockHeight int64 = 10
+
+		// a large number of blocks since lastStoredBlockHeight
+		blockHeight int64 = 3000
+
+		backfillTimes          = 1
+		batchSize       uint32 = 50
+		expectedBatches        = 61
+	)
+
+	contract1, err := flux_aggregator_wrapper.NewFluxAggregator(cltest.NewAddress(), nil)
+	require.NoError(t, err)
+
+	blocks := cltest.NewBlocks(t, 7)
+	backfilledLogs := make([]types.Log, 0)
+	for i := 0; i < 50; i++ {
+		aLog := blocks.LogOnBlockNum(0, contract1.Address())
+		backfilledLogs = append(backfilledLogs, aLog)
+	}
+
+	expectedCalls := mockEthClientExpectedCalls{
+		SubscribeFilterLogs: backfillTimes,
+		HeaderByNumber:      backfillTimes,
+		FilterLogs:          expectedBatches,
+
+		FilterLogsResult: backfilledLogs,
+	}
+
+	chchRawLogs := make(chan chan<- types.Log, backfillTimes)
+	mockEth := newMockEthClient(chchRawLogs, blockHeight, expectedCalls)
+	helper := newBroadcasterHelperWithEthClient(t, mockEth.ethClient, cltest.Head(lastStoredBlockHeight))
+	helper.mockEth = mockEth
+
+	helper.store.Config.Set(orm.EnvVarName("EthLogBackfillBatchSize"), batchSize)
+
+	var backfillCount int64
+	var backfillCountPtr = &backfillCount
+
+	mockEth.checkFilterLogs = func(fromBlock int64, toBlock int64) {
+		times := atomic.LoadInt64(backfillCountPtr)
+		logger.Warnf("Log Batch: --------- times %v - %v, %v", times, fromBlock, toBlock)
+		atomic.StoreInt64(backfillCountPtr, times+1)
+	}
+
+	listener := helper.newLogListener("initial")
+	helper.register(listener, newMockContract(), 1)
+	helper.start()
+
+	defer helper.stop()
+
+	require.Eventually(t, func() bool { return atomic.LoadInt64(backfillCountPtr) == expectedBatches }, 5*time.Second, 10*time.Millisecond)
+
+	helper.unsubscribeAll()
+
+	require.Eventually(t, func() bool { return helper.mockEth.unsubscribeCallCount() >= 1 }, 5*time.Second, 10*time.Millisecond)
+
+	helper.mockEth.assertExpectations(t)
 }
 
 func TestBroadcaster_BroadcastsToCorrectRecipients(t *testing.T) {
 	t.Parallel()
 
-	store, cleanup := cltest.NewStore(t)
+	const blockHeight int64 = 0
+	helper := newBroadcasterHelper(t, blockHeight, 1)
+	helper.start()
+
+	contract1, err := flux_aggregator_wrapper.NewFluxAggregator(cltest.NewAddress(), nil)
+	require.NoError(t, err)
+	contract2, err := flux_aggregator_wrapper.NewFluxAggregator(cltest.NewAddress(), nil)
+	require.NoError(t, err)
+
+	blocks := cltest.NewBlocks(t, 10)
+	addr1SentLogs := []types.Log{
+		blocks.LogOnBlockNum(1, contract1.Address()),
+		blocks.LogOnBlockNum(2, contract1.Address()),
+		blocks.LogOnBlockNum(3, contract1.Address()),
+	}
+	addr2SentLogs := []types.Log{
+		blocks.LogOnBlockNum(4, contract2.Address()),
+		blocks.LogOnBlockNum(5, contract2.Address()),
+		blocks.LogOnBlockNum(6, contract2.Address()),
+	}
+
+	listener1 := helper.newLogListener("listener 1")
+	listener2 := helper.newLogListener("listener 2")
+	listener3 := helper.newLogListener("listener 3")
+	listener4 := helper.newLogListener("listener 4")
+
+	cleanup, _ := cltest.SimulateIncomingHeads(t, cltest.SimulateIncomingHeadsArgs{
+		StartBlock:     0,
+		EndBlock:       10,
+		BackfillDepth:  10,
+		HeadTrackables: []httypes.HeadTrackable{(helper.lb).(httypes.HeadTrackable)},
+		Blocks:         blocks,
+	})
 	defer cleanup()
 
-	const blockHeight int64 = 0
+	helper.register(listener1, contract1, 1)
+	helper.register(listener2, contract1, 1)
+	helper.register(listener3, contract2, 1)
+	helper.register(listener4, contract2, 1)
 
-	var (
-		ethClient     = new(mocks.Client)
-		sub           = new(mocks.Subscription)
-		addr1         = cltest.NewAddress()
-		addr2         = cltest.NewAddress()
-		blockHash1    = cltest.NewHash()
-		blockHash2    = cltest.NewHash()
-		blockHash3    = cltest.NewHash()
-		blockHash4    = cltest.NewHash()
-		blockHash5    = cltest.NewHash()
-		blockHash6    = cltest.NewHash()
-		addr1SentLogs = []types.Log{
-			cltest.RawNewRoundLog(t, addr1, blockHash1, 1, 0, false),
-			cltest.RawNewRoundLog(t, addr1, blockHash2, 2, 0, false),
-			cltest.RawNewRoundLog(t, addr1, blockHash3, 3, 0, false),
-		}
-		addr2SentLogs = []types.Log{
-			cltest.RawNewRoundLog(t, addr2, blockHash4, 4, 0, false),
-			cltest.RawNewRoundLog(t, addr2, blockHash5, 5, 0, false),
-			cltest.RawNewRoundLog(t, addr2, blockHash6, 6, 0, false),
-		}
-	)
-	store.EthClient = ethClient
-
-	contract1, err := flux_aggregator_wrapper.NewFluxAggregator(addr1, nil)
-	require.NoError(t, err)
-	contract2, err := flux_aggregator_wrapper.NewFluxAggregator(addr2, nil)
-	require.NoError(t, err)
-
-	chchRawLogs := make(chan chan<- types.Log, 1)
-	ethClient.On("SubscribeFilterLogs", mock.Anything, mock.Anything, mock.Anything).
-		Run(func(args mock.Arguments) {
-			chchRawLogs <- args.Get(2).(chan<- types.Log)
-		}).
-		Return(sub, nil).
-		Once()
-	ethClient.On("HeaderByNumber", mock.Anything, (*big.Int)(nil)).Return(&models.Head{Number: blockHeight}, nil)
-	ethClient.On("FilterLogs", mock.Anything, mock.Anything).Return(nil, nil)
-	sub.On("Err").Return(nil)
-	sub.On("Unsubscribe").Return()
-
-	orm := log.NewORM(store.DB)
-	lb := log.NewBroadcaster(orm, store.EthClient, store.Config)
-	lb.Start()
-	defer lb.Stop()
-
-	var addr1Logs1, addr1Logs2, addr2Logs1, addr2Logs2 []types.Log
-
-	listener1 := &simpleLogListener{
-		handler: func(lb log.Broadcast) {
-			addr1Logs1 = append(addr1Logs1, lb.RawLog())
-			handleLogBroadcast(t, lb)
-		},
-		consumerID: createJob(t, store).ID,
-	}
-	listener2 := &simpleLogListener{
-		handler: func(lb log.Broadcast) {
-			addr1Logs2 = append(addr1Logs2, lb.RawLog())
-			handleLogBroadcast(t, lb)
-		},
-		consumerID: createJob(t, store).ID,
-	}
-	listener3 := &simpleLogListener{
-		handler: func(lb log.Broadcast) {
-			addr2Logs1 = append(addr2Logs1, lb.RawLog())
-			handleLogBroadcast(t, lb)
-		},
-		consumerID: createJob(t, store).ID,
-	}
-	listener4 := &simpleLogListener{
-		handler: func(lb log.Broadcast) {
-			addr2Logs2 = append(addr2Logs2, lb.RawLog())
-			handleLogBroadcast(t, lb)
-		},
-		consumerID: createJob(t, store).ID,
-	}
-
-	_, unsubscribe := lb.Register(listener1, log.ListenerOpts{
-		Contract: contract1,
-		Logs: []generated.AbigenLog{
-			flux_aggregator_wrapper.FluxAggregatorNewRound{},
-			flux_aggregator_wrapper.FluxAggregatorAnswerUpdated{},
-		},
-	})
-	defer unsubscribe()
-	_, unsubscribe = lb.Register(listener2, log.ListenerOpts{
-		Contract: contract1,
-		Logs: []generated.AbigenLog{
-			flux_aggregator_wrapper.FluxAggregatorNewRound{},
-			flux_aggregator_wrapper.FluxAggregatorAnswerUpdated{},
-		},
-	})
-	defer unsubscribe()
-	_, unsubscribe = lb.Register(listener3, log.ListenerOpts{
-		Contract: contract2,
-		Logs: []generated.AbigenLog{
-			flux_aggregator_wrapper.FluxAggregatorNewRound{},
-			flux_aggregator_wrapper.FluxAggregatorAnswerUpdated{},
-		},
-	})
-	defer unsubscribe()
-	_, unsubscribe = lb.Register(listener4, log.ListenerOpts{
-		Contract: contract2,
-		Logs: []generated.AbigenLog{
-			flux_aggregator_wrapper.FluxAggregatorNewRound{},
-			flux_aggregator_wrapper.FluxAggregatorAnswerUpdated{},
-		},
-	})
-	defer unsubscribe()
-
-	chRawLogs := <-chchRawLogs
+	chRawLogs := <-helper.chchRawLogs
 
 	for _, log := range addr1SentLogs {
 		chRawLogs <- log
@@ -297,57 +354,555 @@ func TestBroadcaster_BroadcastsToCorrectRecipients(t *testing.T) {
 		chRawLogs <- log
 	}
 
-	require.Eventually(t, func() bool { return len(addr1Logs1) == len(addr1SentLogs) }, 5*time.Second, 10*time.Millisecond)
-	require.Eventually(t, func() bool { return len(addr1Logs2) == len(addr1SentLogs) }, 5*time.Second, 10*time.Millisecond)
-	require.Eventually(t, func() bool { return len(addr2Logs1) == len(addr2SentLogs) }, 5*time.Second, 10*time.Millisecond)
-	require.Eventually(t, func() bool { return len(addr2Logs2) == len(addr2SentLogs) }, 5*time.Second, 10*time.Millisecond)
-	requireBroadcastCount(t, store, 12)
+	requireBroadcastCount(t, helper.store, 12)
 
-	lb.Stop()
+	requireEqualLogs(t, addr1SentLogs, listener1.received.uniqueLogs)
+	requireEqualLogs(t, addr1SentLogs, listener2.received.uniqueLogs)
 
-	for i := range addr1SentLogs {
-		require.Equal(t, addr1SentLogs[i], addr1Logs1[i])
-		require.Equal(t, addr1SentLogs[i], addr1Logs2[i])
+	requireEqualLogs(t, addr2SentLogs, listener3.received.uniqueLogs)
+	requireEqualLogs(t, addr2SentLogs, listener4.received.uniqueLogs)
+
+	helper.unsubscribeAll()
+	helper.stop()
+	helper.mockEth.assertExpectations(t)
+}
+
+func TestBroadcaster_BroadcastsAtCorrectHeights(t *testing.T) {
+	t.Parallel()
+
+	const blockHeight int64 = 0
+	helper := newBroadcasterHelper(t, blockHeight, 1)
+	helper.start()
+
+	contract1, err := flux_aggregator_wrapper.NewFluxAggregator(cltest.NewAddress(), nil)
+	require.NoError(t, err)
+
+	blocks := cltest.NewBlocks(t, 10)
+	addr1SentLogs := []types.Log{
+		blocks.LogOnBlockNum(1, contract1.Address()),
+		blocks.LogOnBlockNum(2, contract1.Address()),
+		blocks.LogOnBlockNum(3, contract1.Address()),
 	}
-	for i := range addr2SentLogs {
-		require.Equal(t, addr2SentLogs[i], addr2Logs1[i])
-		require.Equal(t, addr2SentLogs[i], addr2Logs2[i])
+
+	listener1 := helper.newLogListener("listener 1")
+	listener2 := helper.newLogListener("listener 2")
+
+	helper.register(listener1, contract1, 1)
+	helper.register(listener2, contract1, 8)
+
+	cleanup, _ := cltest.SimulateIncomingHeads(t, cltest.SimulateIncomingHeadsArgs{
+		StartBlock:     0,
+		EndBlock:       10,
+		BackfillDepth:  10,
+		HeadTrackables: []httypes.HeadTrackable{(helper.lb).(httypes.HeadTrackable)},
+		Blocks:         blocks,
+		Interval:       250 * time.Millisecond,
+	})
+	defer cleanup()
+
+	chRawLogs := <-helper.chchRawLogs
+
+	for _, log := range addr1SentLogs {
+		chRawLogs <- log
 	}
 
-	ethClient.AssertExpectations(t)
-	sub.AssertExpectations(t)
+	requireBroadcastCount(t, helper.store, 5)
+	helper.stop()
+
+	requireEqualLogs(t,
+		addr1SentLogs,
+		listener1.received.uniqueLogs,
+	)
+	requireEqualLogs(t,
+		[]types.Log{
+			addr1SentLogs[0],
+			addr1SentLogs[1],
+		},
+		listener2.received.uniqueLogs,
+	)
+
+	// unique sends should be equal to sends overall
+	requireEqualLogs(t,
+		listener1.received.uniqueLogs,
+		listener1.received.logs,
+	)
+	requireEqualLogs(t,
+		listener2.received.uniqueLogs,
+		listener2.received.logs,
+	)
+
+	// the logs should have been received at much later heights
+	logsOnBlocks := listener2.received.logsOnBlocks()
+	expectedLogsOnBlocks := []logOnBlock{
+		{
+			logBlockNumber: 1,
+			blockNumber:    8,
+			blockHash:      blocks.Hashes[8],
+		},
+		{
+			logBlockNumber: 2,
+			blockNumber:    9,
+			blockHash:      blocks.Hashes[9],
+		},
+	}
+
+	require.Equal(t, logsOnBlocks, expectedLogsOnBlocks)
+
+	helper.mockEth.assertExpectations(t)
+}
+
+func TestBroadcaster_DeletesOldLogsAfterNumberOfHeads(t *testing.T) {
+	t.Parallel()
+
+	const blockHeight int64 = 0
+	helper := newBroadcasterHelper(t, blockHeight, 1)
+	helper.store.Config.Set(orm.EnvVarName("EthFinalityDepth"), uint(1))
+	helper.start()
+
+	contract1, err := flux_aggregator_wrapper.NewFluxAggregator(cltest.NewAddress(), nil)
+	require.NoError(t, err)
+
+	blocks := cltest.NewBlocks(t, 20)
+	addr1SentLogs := []types.Log{
+		blocks.LogOnBlockNum(1, contract1.Address()),
+		blocks.LogOnBlockNum(2, contract1.Address()),
+		blocks.LogOnBlockNum(3, contract1.Address()),
+	}
+
+	listener1 := helper.newLogListener("listener 1")
+	listener2 := helper.newLogListener("listener 2")
+	listener3 := helper.newLogListener("listener 3")
+	listener4 := helper.newLogListener("listener 4")
+
+	helper.register(listener1, contract1, 1)
+	helper.register(listener2, contract1, 3)
+
+	cleanup, headsDone := cltest.SimulateIncomingHeads(t, cltest.SimulateIncomingHeadsArgs{
+		StartBlock:     0,
+		EndBlock:       5,
+		BackfillDepth:  10,
+		HeadTrackables: []httypes.HeadTrackable{(helper.lb).(httypes.HeadTrackable)},
+		Blocks:         blocks,
+		Interval:       250 * time.Millisecond,
+	})
+	defer cleanup()
+
+	chRawLogs := <-helper.chchRawLogs
+
+	for _, log := range addr1SentLogs {
+		chRawLogs <- log
+	}
+
+	requireBroadcastCount(t, helper.store, 6)
+	<-headsDone
+
+	helper.register(listener3, contract1, 1)
+	cleanup, headsDone = cltest.SimulateIncomingHeads(t, cltest.SimulateIncomingHeadsArgs{
+		StartBlock:     6,
+		EndBlock:       8,
+		BackfillDepth:  1,
+		HeadTrackables: []httypes.HeadTrackable{(helper.lb).(httypes.HeadTrackable)},
+		Blocks:         blocks,
+		Interval:       250 * time.Millisecond,
+	})
+	defer cleanup()
+
+	<-headsDone
+
+	// the new listener should still receive 2 of the 3 logs
+	requireBroadcastCount(t, helper.store, 8)
+	require.Equal(t, 2, len(listener3.received.uniqueLogs))
+
+	helper.register(listener4, contract1, 1)
+	cleanup, headsDone = cltest.SimulateIncomingHeads(t, cltest.SimulateIncomingHeadsArgs{
+		StartBlock:     9,
+		EndBlock:       11,
+		BackfillDepth:  1,
+		HeadTrackables: []httypes.HeadTrackable{(helper.lb).(httypes.HeadTrackable)},
+		Blocks:         blocks,
+		Interval:       250 * time.Millisecond,
+	})
+	defer cleanup()
+
+	<-headsDone
+
+	// but this one should receive none
+	require.Equal(t, 0, len(listener4.received.uniqueLogs))
+
+	helper.stop()
+}
+
+func TestBroadcaster_DeletesOldLogsOnlyAfterFinalityDepth(t *testing.T) {
+	t.Parallel()
+
+	const blockHeight int64 = 0
+	helper := newBroadcasterHelper(t, blockHeight, 1)
+	helper.store.Config.Set(orm.EnvVarName("EthFinalityDepth"), uint(4))
+	helper.start()
+
+	contract1, err := flux_aggregator_wrapper.NewFluxAggregator(cltest.NewAddress(), nil)
+	require.NoError(t, err)
+
+	blocks := cltest.NewBlocks(t, 20)
+	addr1SentLogs := []types.Log{
+		blocks.LogOnBlockNum(1, contract1.Address()),
+		blocks.LogOnBlockNum(2, contract1.Address()),
+		blocks.LogOnBlockNum(3, contract1.Address()),
+	}
+
+	listener1 := helper.newLogListener("listener 1")
+	listener2 := helper.newLogListener("listener 2")
+	listener3 := helper.newLogListener("listener 3")
+	listener4 := helper.newLogListener("listener 4")
+
+	helper.register(listener1, contract1, 1)
+	helper.register(listener2, contract1, 3)
+
+	cleanup, headsDone := cltest.SimulateIncomingHeads(t, cltest.SimulateIncomingHeadsArgs{
+		StartBlock:     0,
+		EndBlock:       5,
+		BackfillDepth:  10,
+		HeadTrackables: []httypes.HeadTrackable{(helper.lb).(httypes.HeadTrackable)},
+		Blocks:         blocks,
+		Interval:       250 * time.Millisecond,
+	})
+	defer cleanup()
+
+	chRawLogs := <-helper.chchRawLogs
+
+	for _, log := range addr1SentLogs {
+		chRawLogs <- log
+	}
+
+	requireBroadcastCount(t, helper.store, 6)
+	<-headsDone
+
+	helper.register(listener3, contract1, 1)
+	cleanup, headsDone = cltest.SimulateIncomingHeads(t, cltest.SimulateIncomingHeadsArgs{
+		StartBlock:     7,
+		EndBlock:       8,
+		BackfillDepth:  1,
+		HeadTrackables: []httypes.HeadTrackable{(helper.lb).(httypes.HeadTrackable)},
+		Blocks:         blocks,
+		Interval:       250 * time.Millisecond,
+	})
+	defer cleanup()
+
+	<-headsDone
+
+	// the new listener should still receive 3 logs because of finality depth being higher than max NumConfirmations
+	requireBroadcastCount(t, helper.store, 9)
+	require.Equal(t, 3, len(listener3.received.uniqueLogs))
+
+	helper.register(listener4, contract1, 1)
+	cleanup, headsDone = cltest.SimulateIncomingHeads(t, cltest.SimulateIncomingHeadsArgs{
+		StartBlock:     10,
+		EndBlock:       11,
+		BackfillDepth:  1,
+		HeadTrackables: []httypes.HeadTrackable{(helper.lb).(httypes.HeadTrackable)},
+		Blocks:         blocks,
+		Interval:       250 * time.Millisecond,
+	})
+	defer cleanup()
+
+	<-headsDone
+
+	// but this one should receive none
+	require.Equal(t, 0, len(listener4.received.uniqueLogs))
+
+	helper.stop()
+}
+
+func TestBroadcaster_FilterByTopicValues(t *testing.T) {
+	t.Parallel()
+
+	const blockHeight int64 = 0
+	helper := newBroadcasterHelper(t, blockHeight, 1)
+	helper.store.Config.Set(orm.EnvVarName("EthFinalityDepth"), uint(3))
+	helper.start()
+
+	contract1, err := flux_aggregator_wrapper.NewFluxAggregator(cltest.NewAddress(), nil)
+	require.NoError(t, err)
+
+	blocks := cltest.NewBlocks(t, 20)
+
+	topic := (flux_aggregator_wrapper.FluxAggregatorNewRound{}).Topic()
+	field1Value1 := cltest.NewHash()
+	field1Value2 := cltest.NewHash()
+	field2Value1 := cltest.NewHash()
+	field2Value2 := cltest.NewHash()
+	addr1SentLogs := []types.Log{
+		blocks.LogOnBlockNumWithTopics(1, 0, contract1.Address(), []common.Hash{topic, field1Value1, field2Value1}),
+		blocks.LogOnBlockNumWithTopics(1, 1, contract1.Address(), []common.Hash{topic, field1Value2, field2Value2}),
+		blocks.LogOnBlockNumWithTopics(2, 0, contract1.Address(), []common.Hash{topic, cltest.NewHash(), field2Value2}),
+		blocks.LogOnBlockNumWithTopics(2, 1, contract1.Address(), []common.Hash{topic, field1Value2, cltest.NewHash()}),
+	}
+
+	listener0 := helper.newLogListener("listener 0")
+	listener1 := helper.newLogListener("listener 1")
+	listener2 := helper.newLogListener("listener 2")
+	listener3 := helper.newLogListener("listener 3")
+	listener4 := helper.newLogListener("listener 4")
+
+	helper.registerWithTopicValues(listener0, contract1, 1,
+		map[common.Hash][][]log.Topic{
+			topic: {}, // no filters, so all values allowed
+		},
+	)
+	helper.registerWithTopicValues(listener1, contract1, 1,
+		map[common.Hash][][]log.Topic{
+			topic: {{} /**/, {}}, // two empty filters, so all values allowed
+		},
+	)
+	helper.registerWithTopicValues(listener2, contract1, 1,
+		map[common.Hash][][]log.Topic{
+			topic: {
+				{log.Topic(field1Value1), log.Topic(field1Value2)} /**/, {log.Topic(field2Value1), log.Topic(field2Value2)}, // two values for each field allowed
+			},
+		},
+	)
+	helper.registerWithTopicValues(listener3, contract1, 1,
+		map[common.Hash][][]log.Topic{
+			topic: {
+				{log.Topic(field1Value1), log.Topic(field1Value2)} /**/, {}, // two values allowed for field 1, and any values for field 2
+			},
+		},
+	)
+	helper.registerWithTopicValues(listener4, contract1, 1,
+		map[common.Hash][][]log.Topic{
+			topic: {
+				{log.Topic(field1Value1)} /**/, {log.Topic(field2Value1)}, // some values allowed
+			},
+		},
+	)
+
+	cleanup, headsDone := cltest.SimulateIncomingHeads(t, cltest.SimulateIncomingHeadsArgs{
+		StartBlock:     0,
+		EndBlock:       5,
+		BackfillDepth:  10,
+		HeadTrackables: []httypes.HeadTrackable{(helper.lb).(httypes.HeadTrackable)},
+		Blocks:         blocks,
+		Interval:       250 * time.Millisecond,
+	})
+	defer cleanup()
+
+	chRawLogs := <-helper.chchRawLogs
+
+	for _, log := range addr1SentLogs {
+		chRawLogs <- log
+	}
+
+	<-headsDone
+
+	require.Equal(t, 4, len(listener0.received.uniqueLogs))
+	require.Equal(t, 4, len(listener1.received.uniqueLogs))
+	require.Equal(t, 2, len(listener2.received.uniqueLogs))
+	require.Equal(t, 3, len(listener3.received.uniqueLogs))
+	require.Equal(t, 1, len(listener4.received.uniqueLogs))
+
+	helper.stop()
+}
+
+func TestBroadcaster_BroadcastsWithOneDelayedLog(t *testing.T) {
+	t.Parallel()
+
+	const blockHeight int64 = 0
+	helper := newBroadcasterHelper(t, blockHeight, 1)
+	helper.store.Config.Set(orm.EnvVarName("EthFinalityDepth"), uint(2))
+	helper.start()
+
+	contract1, err := flux_aggregator_wrapper.NewFluxAggregator(cltest.NewAddress(), nil)
+	require.NoError(t, err)
+
+	blocks := cltest.NewBlocks(t, 12)
+	addr1SentLogs := []types.Log{
+		blocks.LogOnBlockNum(1, contract1.Address()),
+		blocks.LogOnBlockNum(2, contract1.Address()),
+		blocks.LogOnBlockNum(3, contract1.Address()),
+
+		// this log will arrive after head with block number 3 and a previous log for it were already processed
+		blocks.LogOnBlockNumWithIndex(3, 1, contract1.Address()),
+	}
+
+	listener1 := helper.newLogListener("listener 1")
+	helper.register(listener1, contract1, 1)
+
+	chRawLogs := <-helper.chchRawLogs
+
+	chRawLogs <- addr1SentLogs[0]
+	chRawLogs <- addr1SentLogs[1]
+	chRawLogs <- addr1SentLogs[2]
+
+	cleanup, headsDone := cltest.SimulateIncomingHeads(t, cltest.SimulateIncomingHeadsArgs{
+		StartBlock:     0,
+		EndBlock:       3,
+		BackfillDepth:  10,
+		HeadTrackables: []httypes.HeadTrackable{(helper.lb).(httypes.HeadTrackable)},
+		Blocks:         blocks,
+		Interval:       250 * time.Millisecond,
+	})
+	defer cleanup()
+
+	<-headsDone
+
+	chRawLogs <- addr1SentLogs[3]
+
+	cleanup, headsDone = cltest.SimulateIncomingHeads(t, cltest.SimulateIncomingHeadsArgs{
+		StartBlock:     4,
+		EndBlock:       8,
+		BackfillDepth:  1,
+		HeadTrackables: []httypes.HeadTrackable{(helper.lb).(httypes.HeadTrackable)},
+		Blocks:         blocks,
+		Interval:       250 * time.Millisecond,
+	})
+	defer cleanup()
+
+	<-headsDone
+
+	requireBroadcastCount(t, helper.store, 4)
+	helper.stop()
+
+	helper.mockEth.assertExpectations(t)
+}
+
+func TestBroadcaster_BroadcastsAtCorrectHeightsWithLogsEarlierThanHeads(t *testing.T) {
+	t.Parallel()
+
+	const blockHeight int64 = 0
+	helper := newBroadcasterHelper(t, blockHeight, 1)
+	helper.start()
+
+	contract1, err := flux_aggregator_wrapper.NewFluxAggregator(cltest.NewAddress(), nil)
+	require.NoError(t, err)
+
+	blocks := cltest.NewBlocks(t, 6)
+	addr1SentLogs := []types.Log{
+		blocks.LogOnBlockNum(1, contract1.Address()),
+		blocks.LogOnBlockNum(2, contract1.Address()),
+		blocks.LogOnBlockNum(3, contract1.Address()),
+	}
+
+	listener1 := helper.newLogListener("listener 1")
+	helper.register(listener1, contract1, 1)
+
+	chRawLogs := <-helper.chchRawLogs
+
+	for _, log := range addr1SentLogs {
+		chRawLogs <- log
+	}
+
+	cleanup, _ := cltest.SimulateIncomingHeads(t, cltest.SimulateIncomingHeadsArgs{
+		StartBlock:     0,
+		EndBlock:       10,
+		BackfillDepth:  10,
+		HeadTrackables: []httypes.HeadTrackable{(helper.lb).(httypes.HeadTrackable)},
+		Blocks:         blocks,
+		Interval:       250 * time.Millisecond,
+	})
+	defer cleanup()
+
+	requireBroadcastCount(t, helper.store, 3)
+	helper.stop()
+
+	requireEqualLogs(t,
+		addr1SentLogs,
+		listener1.received.uniqueLogs,
+	)
+
+	// unique sends should be equal to sends overall
+	requireEqualLogs(t,
+		listener1.received.uniqueLogs,
+		listener1.received.logs,
+	)
+
+	helper.mockEth.assertExpectations(t)
+}
+
+func TestBroadcaster_BroadcastsAtCorrectHeightsWithHeadsEarlierThanLogs(t *testing.T) {
+	t.Parallel()
+
+	const blockHeight int64 = 0
+	helper := newBroadcasterHelper(t, blockHeight, 1)
+	helper.store.Config.Set(orm.EnvVarName("EthFinalityDepth"), uint(2))
+	helper.start()
+
+	contract1, err := flux_aggregator_wrapper.NewFluxAggregator(cltest.NewAddress(), nil)
+	require.NoError(t, err)
+
+	blocks := cltest.NewBlocks(t, 12)
+	addr1SentLogs := []types.Log{
+		blocks.LogOnBlockNum(1, contract1.Address()),
+		blocks.LogOnBlockNum(2, contract1.Address()),
+		blocks.LogOnBlockNum(3, contract1.Address()),
+	}
+
+	listener1 := helper.newLogListener("listener 1")
+	helper.register(listener1, contract1, 1)
+
+	chRawLogs := <-helper.chchRawLogs
+
+	cleanup, headsDone := cltest.SimulateIncomingHeads(t, cltest.SimulateIncomingHeadsArgs{
+		StartBlock:     0,
+		EndBlock:       6,
+		BackfillDepth:  10,
+		HeadTrackables: []httypes.HeadTrackable{(helper.lb).(httypes.HeadTrackable)},
+		Blocks:         blocks,
+		Interval:       250 * time.Millisecond,
+	})
+	defer cleanup()
+
+	<-headsDone
+
+	for _, log := range addr1SentLogs {
+		chRawLogs <- log
+	}
+
+	cleanup, headsDone = cltest.SimulateIncomingHeads(t, cltest.SimulateIncomingHeadsArgs{
+		StartBlock:     7,
+		EndBlock:       8,
+		BackfillDepth:  1,
+		HeadTrackables: []httypes.HeadTrackable{(helper.lb).(httypes.HeadTrackable)},
+		Blocks:         blocks,
+		Interval:       250 * time.Millisecond,
+	})
+	defer cleanup()
+
+	<-headsDone
+
+	requireBroadcastCount(t, helper.store, 3)
+	helper.stop()
+
+	requireEqualLogs(t,
+		addr1SentLogs,
+		listener1.received.uniqueLogs,
+	)
+
+	// unique sends should be equal to sends overall
+	requireEqualLogs(t,
+		listener1.received.uniqueLogs,
+		listener1.received.logs,
+	)
+
+	helper.mockEth.assertExpectations(t)
 }
 
 func TestBroadcaster_Register_ResubscribesToMostRecentlySeenBlock(t *testing.T) {
 	t.Parallel()
 
-	store, cleanup := cltest.NewStore(t)
-	defer cleanup()
-
 	const (
+		backfillTimes = 1
 		blockHeight   = 15
 		expectedBlock = 5
 	)
 	var (
 		ethClient = new(mocks.Client)
 		sub       = new(mocks.Subscription)
-		listener0 = new(logmocks.Listener)
-		listener1 = new(logmocks.Listener)
-		listener2 = new(logmocks.Listener)
-		addr0     = cltest.NewAddress()
-		addr1     = cltest.NewAddress()
-		addr2     = cltest.NewAddress()
-		contract0 = new(logmocks.AbigenContract)
-		contract1 = new(logmocks.AbigenContract)
-		contract2 = new(logmocks.AbigenContract)
+		contract0 = newMockContract()
+		contract1 = newMockContract()
+		contract2 = newMockContract()
 	)
-	store.EthClient = ethClient
 
-	contract0.On("Address").Return(addr0)
-	contract1.On("Address").Return(addr1)
-	contract2.On("Address").Return(addr2)
-
-	chchRawLogs := make(chan chan<- types.Log, 1)
+	chchRawLogs := make(chan chan<- types.Log, backfillTimes)
 	chStarted := make(chan struct{})
 	ethClient.On("SubscribeFilterLogs", mock.Anything, mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) {
@@ -363,23 +918,23 @@ func TestBroadcaster_Register_ResubscribesToMostRecentlySeenBlock(t *testing.T) 
 		Return(sub, nil).
 		Times(2)
 
-	ethClient.On("HeaderByNumber", mock.Anything, (*big.Int)(nil)).
+	ethClient.On("HeadByNumber", mock.Anything, (*big.Int)(nil)).
 		Return(&models.Head{Number: blockHeight}, nil)
 	ethClient.On("FilterLogs", mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) {
 			query := args.Get(1).(ethereum.FilterQuery)
 			require.Equal(t, big.NewInt(expectedBlock), query.FromBlock)
-			require.Contains(t, query.Addresses, addr0)
+			require.Contains(t, query.Addresses, contract0.Address())
 			require.Len(t, query.Addresses, 1)
 		}).
 		Return(nil, nil).
-		Once()
+		Times(backfillTimes)
 	ethClient.On("FilterLogs", mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) {
 			query := args.Get(1).(ethereum.FilterQuery)
 			require.Equal(t, big.NewInt(expectedBlock), query.FromBlock)
-			require.Contains(t, query.Addresses, addr0)
-			require.Contains(t, query.Addresses, addr1)
+			require.Contains(t, query.Addresses, contract0.Address())
+			require.Contains(t, query.Addresses, contract1.Address())
 			require.Len(t, query.Addresses, 2)
 		}).
 		Return(nil, nil).
@@ -388,9 +943,9 @@ func TestBroadcaster_Register_ResubscribesToMostRecentlySeenBlock(t *testing.T) 
 		Run(func(args mock.Arguments) {
 			query := args.Get(1).(ethereum.FilterQuery)
 			require.Equal(t, big.NewInt(expectedBlock), query.FromBlock)
-			require.Contains(t, query.Addresses, addr0)
-			require.Contains(t, query.Addresses, addr1)
-			require.Contains(t, query.Addresses, addr2)
+			require.Contains(t, query.Addresses, contract0.Address())
+			require.Contains(t, query.Addresses, contract1.Address())
+			require.Contains(t, query.Addresses, contract2.Address())
 			require.Len(t, query.Addresses, 3)
 		}).
 		Return(nil, nil).
@@ -399,39 +954,18 @@ func TestBroadcaster_Register_ResubscribesToMostRecentlySeenBlock(t *testing.T) 
 	sub.On("Unsubscribe").Return()
 	sub.On("Err").Return(nil)
 
-	listener0.On("JobID").Return(models.NewJobID()).Maybe()
-	listener0.On("JobIDV2").Return(int32(123)).Maybe()
-	listener0.On("IsV2Job").Return(true).Maybe()
-	listener1.On("JobID").Return(models.NewJobID()).Maybe()
-	listener1.On("JobIDV2").Return(int32(456)).Maybe()
-	listener1.On("IsV2Job").Return(true).Maybe()
-	listener2.On("JobID").Return(models.NewJobID()).Maybe()
-	listener2.On("JobIDV2").Return(int32(789)).Maybe()
-	listener2.On("IsV2Job").Return(true).Maybe()
-	listener0.On("OnConnect").Return().Maybe()
-	listener1.On("OnConnect").Return().Maybe()
-	listener2.On("OnConnect").Return().Maybe()
-	listener0.On("OnDisconnect").Return().Maybe()
-	listener1.On("OnDisconnect").Return().Maybe()
-	listener2.On("OnDisconnect").Return().Maybe()
+	helper := newBroadcasterHelperWithEthClient(t, ethClient, nil)
+	helper.lb.AddDependents(1)
+	helper.start()
+	defer helper.stop()
 
-	orm := log.NewORM(store.DB)
-	lb := log.NewBroadcaster(orm, ethClient, store.Config)
-	lb.AddDependents(1)
-	lb.Start()
-	defer lb.Stop()
+	listener0 := helper.newLogListener("0")
+	listener1 := helper.newLogListener("1")
+	listener2 := helper.newLogListener("2")
 
 	// Subscribe #0
-	_, unsubscribe := lb.Register(listener0, log.ListenerOpts{
-		Contract: contract0,
-		Logs: []generated.AbigenLog{
-			flux_aggregator_wrapper.FluxAggregatorNewRound{},
-			flux_aggregator_wrapper.FluxAggregatorAnswerUpdated{},
-		},
-	})
-	defer unsubscribe()
-
-	lb.DependentReady()
+	helper.register(listener0, contract0, 1)
+	helper.lb.DependentReady()
 
 	// Await startup
 	select {
@@ -447,14 +981,7 @@ func TestBroadcaster_Register_ResubscribesToMostRecentlySeenBlock(t *testing.T) 
 	}
 
 	// Subscribe #1
-	_, unsubscribe = lb.Register(listener1, log.ListenerOpts{
-		Contract: contract1,
-		Logs: []generated.AbigenLog{
-			flux_aggregator_wrapper.FluxAggregatorNewRound{},
-			flux_aggregator_wrapper.FluxAggregatorAnswerUpdated{},
-		},
-	})
-	defer unsubscribe()
+	helper.register(listener1, contract1, 1)
 
 	select {
 	case <-chchRawLogs:
@@ -463,14 +990,7 @@ func TestBroadcaster_Register_ResubscribesToMostRecentlySeenBlock(t *testing.T) 
 	}
 
 	// Subscribe #2
-	_, unsubscribe = lb.Register(listener1, log.ListenerOpts{
-		Contract: contract2,
-		Logs: []generated.AbigenLog{
-			flux_aggregator_wrapper.FluxAggregatorNewRound{},
-			flux_aggregator_wrapper.FluxAggregatorAnswerUpdated{},
-		},
-	})
-	defer unsubscribe()
+	helper.register(listener2, contract2, 1)
 
 	select {
 	case <-chchRawLogs:
@@ -479,10 +999,8 @@ func TestBroadcaster_Register_ResubscribesToMostRecentlySeenBlock(t *testing.T) 
 	}
 
 	cltest.EventuallyExpectationsMet(t, ethClient, 5*time.Second, 10*time.Millisecond)
-	cltest.EventuallyExpectationsMet(t, listener0, 5*time.Second, 10*time.Millisecond)
-	cltest.EventuallyExpectationsMet(t, listener1, 5*time.Second, 10*time.Millisecond)
-	cltest.EventuallyExpectationsMet(t, listener2, 5*time.Second, 10*time.Millisecond)
 	cltest.EventuallyExpectationsMet(t, sub, 5*time.Second, 10*time.Millisecond)
+	helper.unsubscribeAll()
 }
 
 func TestBroadcaster_ReceivesAllLogsWhenResubscribing(t *testing.T) {
@@ -491,14 +1009,13 @@ func TestBroadcaster_ReceivesAllLogsWhenResubscribing(t *testing.T) {
 	addrA := common.HexToAddress("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	addrB := common.HexToAddress("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
 
-	blockHashes := make(map[int64]common.Hash)
+	blocks := cltest.NewBlocks(t, 20)
+
 	logsA := make(map[uint]types.Log)
 	logsB := make(map[uint]types.Log)
 	for n := 1; n < 18; n++ {
-		blockHash := cltest.NewHash()
-		blockHashes[int64(n)] = blockHash
-		logsA[uint(n)] = cltest.RawNewRoundLog(t, addrA, blockHash, uint64(n), uint(n), false)
-		logsB[uint(n)] = cltest.RawNewRoundLog(t, addrB, blockHash, uint64(n), uint(100+n), false)
+		logsA[uint(n)] = blocks.LogOnBlockNum(uint64(n), addrA)
+		logsB[uint(n)] = blocks.LogOnBlockNum(uint64(n), addrB)
 	}
 
 	tests := []struct {
@@ -517,12 +1034,13 @@ func TestBroadcaster_ReceivesAllLogsWhenResubscribing(t *testing.T) {
 			blockHeight1: 0,
 			batch1:       []uint{1, 2},
 
-			blockHeight2:     2,
+			blockHeight2:     3,
 			backfillableLogs: nil,
-			batch2:           []uint{3, 4},
+			batch2:           []uint{7, 8},
 
-			expectedFilteredA: []uint{1, 2, 3, 4},
-			expectedFilteredB: []uint{3, 4}},
+			expectedFilteredA: []uint{1, 2, 7, 8},
+			expectedFilteredB: []uint{7, 8},
+		},
 		{
 			name: "no backfilled logs, overlap",
 
@@ -578,74 +1096,15 @@ func TestBroadcaster_ReceivesAllLogsWhenResubscribing(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			store, cleanup := cltest.NewStore(t)
-			defer cleanup()
+			helper := newBroadcasterHelper(t, test.blockHeight1, 2)
+			var backfillDepth int64 = 5
+			helper.store.Config.Set(orm.EnvVarName("BlockBackfillDepth"), uint64(backfillDepth)) // something other than default
 
-			var (
-				ethClient           = new(mocks.Client)
-				sub                 = new(mocks.Subscription)
-				backfillDepth int64 = 5 // something other than default
-			)
+			helper.start()
+			defer helper.stop()
 
-			store.Config.Set(orm.EnvVarName("BlockBackfillDepth"), uint64(backfillDepth))
-			store.EthClient = ethClient
-
-			chchRawLogs := make(chan chan<- types.Log, 1)
-			ethClient.On("SubscribeFilterLogs", mock.Anything, mock.Anything, mock.Anything).
-				Run(func(args mock.Arguments) {
-					chRawLogs := args.Get(2).(chan<- types.Log)
-					chchRawLogs <- chRawLogs
-				}).
-				Return(sub, nil).
-				Twice()
-
-			ethClient.On("HeaderByNumber", mock.Anything, (*big.Int)(nil)).Return(&models.Head{Number: test.blockHeight1}, nil).Once()
-			ethClient.On("FilterLogs", mock.Anything, mock.Anything).Return(nil, nil).Once()
-
-			sub.On("Err").Return(nil)
-			sub.On("Unsubscribe").Return()
-
-			orm := log.NewORM(store.DB)
-			lb := log.NewBroadcaster(orm, store.EthClient, store.Config)
-			lb.Start()
-			defer lb.Stop()
-
-			var recvdA received
-			var recvdB received
-
-			logListenerA := &simpleLogListener{
-				handler: func(lb log.Broadcast) {
-					logger.Debugf("log A: %v", lb.RawLog().BlockNumber)
-					consumed, err := lb.WasAlreadyConsumed()
-					require.NoError(t, err)
-
-					recvdA.Lock()
-					defer recvdA.Unlock()
-					if !consumed {
-						recvdA.logs = append(recvdA.logs, lb.RawLog())
-						err = lb.MarkConsumed()
-						require.NoError(t, err)
-					}
-				},
-				consumerID: createJob(t, store).ID,
-			}
-
-			logListenerB := &simpleLogListener{
-				handler: func(lb log.Broadcast) {
-					logger.Infof("log B: %v", lb.RawLog().BlockNumber)
-					consumed, err := lb.WasAlreadyConsumed()
-					require.NoError(t, err)
-
-					recvdB.Lock()
-					defer recvdB.Unlock()
-					if !consumed {
-						recvdB.logs = append(recvdB.logs, lb.RawLog())
-						err = lb.MarkConsumed()
-						require.NoError(t, err)
-					}
-				},
-				consumerID: createJob(t, store).ID,
-			}
+			logListenerA := helper.newLogListener("logListenerA")
+			logListenerB := helper.newLogListener("logListenerB")
 
 			contractA, err := flux_aggregator_wrapper.NewFluxAggregator(addrA, nil)
 			require.NoError(t, err)
@@ -653,28 +1112,25 @@ func TestBroadcaster_ReceivesAllLogsWhenResubscribing(t *testing.T) {
 			require.NoError(t, err)
 
 			// Register listener A
-			_, unsubscribe := lb.Register(logListenerA, log.ListenerOpts{
-				Contract: contractA,
-				Logs: []generated.AbigenLog{
-					flux_aggregator_wrapper.FluxAggregatorNewRound{},
-					flux_aggregator_wrapper.FluxAggregatorAnswerUpdated{},
-				},
-			})
-			defer unsubscribe()
+			helper.register(logListenerA, contractA, 1)
 
 			// Send initial logs
-			chRawLogs1 := <-chchRawLogs
-			cleanup = cltest.SimulateIncomingHeads(t, cltest.SimulateIncomingHeadsArgs{
+			chRawLogs1 := <-helper.chchRawLogs
+			cleanup, headsDone := cltest.SimulateIncomingHeads(t, cltest.SimulateIncomingHeadsArgs{
 				StartBlock:    test.blockHeight1,
-				EndBlock:      test.blockHeight2,
+				EndBlock:      test.blockHeight2 + 1,
 				BackfillDepth: backfillDepth,
-				Hashes:        blockHashes,
-				HeadTrackables: []strpkg.HeadTrackable{cltest.HeadTrackableFunc(func(_ context.Context, head models.Head) {
+				Blocks:        blocks,
+				HeadTrackables: []httypes.HeadTrackable{(helper.lb).(httypes.HeadTrackable), cltest.HeadTrackableFunc(func(_ context.Context, head models.Head) {
+					logger.Warnf("------------ HEAD TRACKABLE (%v) --------------", head.Number)
 					if _, exists := logsA[uint(head.Number)]; !exists {
+						logger.Warnf("  ** not exists")
 						return
 					} else if !batchContains(test.batch1, uint(head.Number)) {
+						logger.Warnf("  ** not batchContains %v %v", head.Number, test.batch1)
 						return
 					}
+					logger.Warnf("  ** yup!")
 					select {
 					case chRawLogs1 <- logsA[uint(head.Number)]:
 					case <-time.After(5 * time.Second):
@@ -682,47 +1138,40 @@ func TestBroadcaster_ReceivesAllLogsWhenResubscribing(t *testing.T) {
 					}
 				})},
 			})
-			defer cleanup()
 
-			expectedA := received{
-				logs: pickLogs(t, logsA, test.batch1),
-			}
-			requireAllReceived(t, &expectedA, &recvdA)
-			requireBroadcastCount(t, store, len(test.batch1))
+			requireBroadcastCount(t, helper.store, len(test.batch1))
+			expectedA := newReceived(pickLogs(logsA, test.batch1))
+			logListenerA.requireAllReceived(t, expectedA)
 
+			<-headsDone
 			cleanup()
 
-			ethClient.On("HeaderByNumber", mock.Anything, (*big.Int)(nil)).Return(&models.Head{Number: test.blockHeight2}, nil).Once()
+			helper.mockEth.ethClient.On("HeadByNumber", mock.Anything, (*big.Int)(nil)).Return(&models.Head{Number: test.blockHeight2}, nil).Once()
 
-			combinedLogs := append(pickLogs(t, logsA, test.backfillableLogs), pickLogs(t, logsB, test.backfillableLogs)...)
-			call := ethClient.On("FilterLogs", mock.Anything, mock.Anything).Return(combinedLogs, nil).Once()
+			combinedLogs := append(pickLogs(logsA, test.backfillableLogs), pickLogs(logsB, test.backfillableLogs)...)
+			call := helper.mockEth.ethClient.On("FilterLogs", mock.Anything, mock.Anything).Return(combinedLogs, nil).Once()
 			call.Run(func(args mock.Arguments) {
 				// Validate that the ethereum.FilterQuery is specified correctly for the backfill that we expect
 				fromBlock := args.Get(1).(ethereum.FilterQuery).FromBlock
 				expected := big.NewInt(0)
-				if test.blockHeight2 > backfillDepth {
-					expected = big.NewInt(int64(test.blockHeight2 - backfillDepth))
+				if helper.lb.LatestHead() != nil && helper.lb.LatestHead().Number > test.blockHeight2-backfillDepth {
+					expected = big.NewInt(helper.lb.LatestHead().Number)
+				} else if test.blockHeight2 > backfillDepth {
+					expected = big.NewInt(test.blockHeight2 - backfillDepth)
 				}
 				require.Equal(t, expected, fromBlock)
 			})
 
-			// Register listener B (triggers resubscription)
-			_, unsubscribe = lb.Register(logListenerB, log.ListenerOpts{
-				Contract: contractB,
-				Logs: []generated.AbigenLog{
-					flux_aggregator_wrapper.FluxAggregatorNewRound{},
-					flux_aggregator_wrapper.FluxAggregatorAnswerUpdated{},
-				},
-			})
-			defer unsubscribe()
+			// Register listener B (triggers re-subscription)
+			helper.register(logListenerB, contractB, 1)
 
 			// Send second batch of new logs
-			chRawLogs2 := <-chchRawLogs
-			cleanup = cltest.SimulateIncomingHeads(t, cltest.SimulateIncomingHeadsArgs{
+			chRawLogs2 := <-helper.chchRawLogs
+			cleanup, _ = cltest.SimulateIncomingHeads(t, cltest.SimulateIncomingHeadsArgs{
 				StartBlock:    test.blockHeight2,
 				BackfillDepth: backfillDepth,
-				Hashes:        blockHashes,
-				HeadTrackables: []strpkg.HeadTrackable{cltest.HeadTrackableFunc(func(_ context.Context, head models.Head) {
+				Blocks:        blocks,
+				HeadTrackables: []httypes.HeadTrackable{(helper.lb).(httypes.HeadTrackable), cltest.HeadTrackableFunc(func(_ context.Context, head models.Head) {
 					if _, exists := logsA[uint(head.Number)]; exists && batchContains(test.batch2, uint(head.Number)) {
 						select {
 						case chRawLogs2 <- logsA[uint(head.Number)]:
@@ -741,17 +1190,13 @@ func TestBroadcaster_ReceivesAllLogsWhenResubscribing(t *testing.T) {
 			})
 			defer cleanup()
 
-			expectedA = received{
-				logs: pickLogs(t, logsA, test.expectedFilteredA),
-			}
-			expectedB := received{
-				logs: pickLogs(t, logsB, test.expectedFilteredB),
-			}
-			requireAllReceived(t, &expectedA, &recvdA)
-			requireAllReceived(t, &expectedB, &recvdB)
-			requireBroadcastCount(t, store, len(test.expectedFilteredA)+len(test.expectedFilteredB))
+			expectedA = newReceived(pickLogs(logsA, test.expectedFilteredA))
+			expectedB := newReceived(pickLogs(logsB, test.expectedFilteredB))
+			logListenerA.requireAllReceived(t, expectedA)
+			logListenerB.requireAllReceived(t, expectedB)
+			requireBroadcastCount(t, helper.store, len(test.expectedFilteredA)+len(test.expectedFilteredB))
 
-			ethClient.AssertExpectations(t)
+			helper.mockEth.ethClient.AssertExpectations(t)
 		})
 	}
 }
@@ -787,7 +1232,7 @@ func TestBroadcaster_AppendLogChannel(t *testing.T) {
 	ch2 := make(chan types.Log)
 	ch3 := make(chan types.Log)
 
-	lb := log.NewBroadcaster(nil, nil, nil)
+	lb := log.NewBroadcaster(nil, nil, nil, nil)
 	chCombined := lb.ExportedAppendLogChannel(ch1, ch2)
 	chCombined = lb.ExportedAppendLogChannel(chCombined, ch3)
 
@@ -821,216 +1266,162 @@ func TestBroadcaster_AppendLogChannel(t *testing.T) {
 }
 
 func TestBroadcaster_InjectsBroadcastRecordFunctions(t *testing.T) {
-	store, cleanup := cltest.NewStore(t)
-	defer cleanup()
-
 	const blockHeight int64 = 0
+	helper := newBroadcasterHelper(t, blockHeight, 1)
+	helper.start()
+	defer helper.stop()
 
-	ethClient := new(mocks.Client)
-	sub := new(mocks.Subscription)
-	store.EthClient = ethClient
+	blocks := cltest.NewBlocks(t, 100)
 
-	chchRawLogs := make(chan chan<- types.Log, 1)
+	logListener := helper.newLogListener("logListener")
 
-	ethClient.On("SubscribeFilterLogs", mock.Anything, mock.Anything, mock.Anything).
-		Run(func(args mock.Arguments) {
-			chRawLogs := args.Get(2).(chan<- types.Log)
-			chchRawLogs <- chRawLogs
-		}).
-		Return(sub, nil).
-		Once()
-
-	ethClient.On("HeaderByNumber", mock.Anything, (*big.Int)(nil)).Return(&models.Head{Number: blockHeight}, nil)
-	ethClient.On("FilterLogs", mock.Anything, mock.Anything).Return([]types.Log{}, nil).Once()
-
-	sub.On("Err").Return(nil)
-	sub.On("Unsubscribe").Return()
-
-	orm := log.NewORM(store.DB)
-	lb := log.NewBroadcaster(orm, store.EthClient, store.Config)
-
-	lb.Start()
-	defer lb.Stop()
-
-	var broadcastCount int32 = 0
-
-	job := createJob(t, store)
-	logListener := &simpleLogListener{
-		handler: func(lb log.Broadcast) {
-			consumed, err := lb.WasAlreadyConsumed()
-			require.NoError(t, err)
-			require.False(t, consumed)
-			err = lb.MarkConsumed()
-			require.NoError(t, err)
-			consumed, err = lb.WasAlreadyConsumed()
-			require.NoError(t, err)
-			require.True(t, consumed)
-			atomic.AddInt32(&broadcastCount, 1)
-		},
-		consumerID: job.ID,
-	}
-	addr := cltest.NewAddress()
-	contract := new(logmocks.AbigenContract)
-	contract.On("Address").Return(addr)
+	contract := newMockContract()
 	contract.On("ParseLog", mock.Anything).Return(flux_aggregator_wrapper.FluxAggregatorNewRound{}, nil).Once()
 	contract.On("ParseLog", mock.Anything).Return(flux_aggregator_wrapper.FluxAggregatorAnswerUpdated{}, nil).Once()
 
-	_, unsubscribe := lb.Register(logListener, log.ListenerOpts{
-		Contract: contract,
-		Logs: []generated.AbigenLog{
-			flux_aggregator_wrapper.FluxAggregatorNewRound{},
-			flux_aggregator_wrapper.FluxAggregatorAnswerUpdated{},
-		},
+	helper.register(logListener, contract, uint64(5))
+
+	cleanup, _ := cltest.SimulateIncomingHeads(t, cltest.SimulateIncomingHeadsArgs{
+		StartBlock:     3,
+		BackfillDepth:  10,
+		HeadTrackables: []httypes.HeadTrackable{(helper.lb).(httypes.HeadTrackable)},
+		Blocks:         blocks,
 	})
-	defer unsubscribe()
-
-	hash0 := cltest.NewHash()
-	hash1 := cltest.NewHash()
-
-	newRoundTopic := (flux_aggregator_wrapper.FluxAggregatorNewRound{}).Topic()
-	answerUpdatedTopic := (flux_aggregator_wrapper.FluxAggregatorAnswerUpdated{}).Topic()
-
-	chRawLogs := <-chchRawLogs
-	chRawLogs <- types.Log{Address: addr, BlockHash: hash0, BlockNumber: 0, Index: 0, Topics: []common.Hash{newRoundTopic, cltest.NewHash()}}
-	chRawLogs <- types.Log{Address: addr, BlockHash: hash1, BlockNumber: 1, Index: 0, Topics: []common.Hash{answerUpdatedTopic, cltest.NewHash()}}
-
-	require.Eventually(t, func() bool { return atomic.LoadInt32(&broadcastCount) == 2 }, 5*time.Second, 10*time.Millisecond)
-	requireBroadcastCount(t, store, 2)
-}
-
-func TestBroadcaster_ProcessesLogsFromReorgs(t *testing.T) {
-	store, cleanup := cltest.NewStore(t)
 	defer cleanup()
 
-	ethClient := new(mocks.Client)
-	sub := new(mocks.Subscription)
-	store.EthClient = ethClient
+	chRawLogs := <-helper.chchRawLogs
+	chRawLogs <- blocks.LogOnBlockNum(0, contract.Address())
+	chRawLogs <- blocks.LogOnBlockNum(1, contract.Address())
 
-	const (
-		startBlockHeight int64 = 0
-	)
+	require.Eventually(t, func() bool { return len(logListener.received.uniqueLogs) >= 2 }, 5*time.Second, 10*time.Millisecond)
+	requireBroadcastCount(t, helper.store, 2)
 
-	chchRawLogs := make(chan chan<- types.Log, 1)
-	ethClient.On("SubscribeFilterLogs", mock.Anything, mock.Anything, mock.Anything).
-		Run(func(args mock.Arguments) { chchRawLogs <- args.Get(2).(chan<- types.Log) }).
-		Return(sub, nil).
-		Once()
-	ethClient.On("HeaderByNumber", mock.Anything, (*big.Int)(nil)).Return(&models.Head{Number: startBlockHeight}, nil)
-	ethClient.On("FilterLogs", mock.Anything, mock.Anything).Return([]types.Log{}, nil).Once()
-	sub.On("Unsubscribe").Return()
-	sub.On("Err").Return(nil)
+	helper.mockEth.ethClient.AssertExpectations(t)
+}
 
-	orm := log.NewORM(store.DB)
-	lb := log.NewBroadcaster(orm, store.EthClient, store.Config)
-	lb.Start()
-	defer lb.Stop()
+func TestBroadcaster_ProcessesLogsFromReorgsAndMissedHead(t *testing.T) {
+	g := gomega.NewGomegaWithT(t)
+
+	const startBlockHeight int64 = 0
+	helper := newBroadcasterHelper(t, startBlockHeight, 1)
+	helper.start()
+	defer helper.stop()
+
+	blocks := cltest.NewBlocks(t, 10)
+	blocksForked := blocks.ForkAt(t, 1, 5)
 
 	var (
-		blockHash0  = cltest.NewHash()
-		blockHash1  = cltest.NewHash()
-		blockHash2  = cltest.NewHash()
-		blockHash1R = cltest.NewHash()
-		blockHash2R = cltest.NewHash()
-
 		addr = cltest.NewAddress()
 
-		log0        = cltest.RawNewRoundLog(t, addr, blockHash0, 0, 0, false)
-		log1        = cltest.RawNewRoundLog(t, addr, blockHash1, 1, 0, false)
-		log2        = cltest.RawNewRoundLog(t, addr, blockHash2, 2, 0, false)
-		log1Removed = cltest.RawNewRoundLog(t, addr, blockHash1, 1, 0, true)
-		log2Removed = cltest.RawNewRoundLog(t, addr, blockHash2, 2, 0, true)
-		log1R       = cltest.RawNewRoundLog(t, addr, blockHash1R, 1, 0, false)
-		log2R       = cltest.RawNewRoundLog(t, addr, blockHash2R, 2, 0, false)
+		log0        = blocks.LogOnBlockNum(0, addr)
+		log1        = blocks.LogOnBlockNum(1, addr)
+		log2        = blocks.LogOnBlockNum(2, addr)
+		log1Removed = blocks.LogOnBlockNumRemoved(1, addr)
+		log2Removed = blocks.LogOnBlockNumRemoved(2, addr)
+		log1R       = blocksForked.LogOnBlockNum(1, addr)
+		log2R       = blocksForked.LogOnBlockNum(2, addr)
+		log3R1      = blocksForked.LogOnBlockNumWithIndex(3, 0, addr)
+		log3R2      = blocksForked.LogOnBlockNumWithIndex(3, 1, addr) // second log on the same block
 
-		logs = []types.Log{
-			log0,
-			log1,
-			log2,
-			log1Removed,
-			log2Removed,
-			log1R,
-			log2R,
+		log1RRemoved  = blocksForked.LogOnBlockNumRemoved(1, addr)
+		log2RRemoved  = blocksForked.LogOnBlockNumRemoved(2, addr)
+		log3R1Removed = blocksForked.LogOnBlockNumWithIndexRemoved(3, 0, addr)
+		log3R2Removed = blocksForked.LogOnBlockNumWithIndexRemoved(3, 1, addr)
+
+		events = []interface{}{
+			blocks.Head(0), log0,
+			log1, // head1 missing
+			blocks.Head(2), log2,
+			blocks.Head(3),
+			blocksForked.Head(1), log1Removed, log2Removed, log1R,
+			blocksForked.Head(2), log2R,
+			log3R1, blocksForked.Head(3), log3R2,
+			blocksForked.Head(4),
+			log1RRemoved, log0, log1, blocks.Head(4), log2, log2RRemoved, log3R1Removed, log3R2Removed, // a reorg back to the previous chain
+			blocks.Head(5),
+			blocks.Head(6),
+			blocks.Head(7),
 		}
-		expected = []types.Log{log0, log1, log2, log1R, log2R}
-	)
 
-	job := createJob(t, store)
-	var recvd []log.Broadcast
-	var recvdMu sync.Mutex
-	listener := &simpleLogListener{
-		handler: func(lb log.Broadcast) {
-			recvdMu.Lock()
-			defer recvdMu.Unlock()
-			recvd = append(recvd, lb)
-			handleLogBroadcast(t, lb)
-		},
-		consumerID: job.ID,
-	}
+		expectedA = []types.Log{log0, log1, log2, log1R, log2R, log3R1, log3R2}
+
+		// listenerB needs 3 confirmations, so log2 is not sent to after the first reorg,
+		// but is later - after the second reorg (back to the previous chain)
+		expectedB = []types.Log{log0, log1, log1R, log2R, log2}
+	)
 
 	contract, err := flux_aggregator_wrapper.NewFluxAggregator(addr, nil)
 	require.NoError(t, err)
 
-	_, unsubscribe := lb.Register(listener, log.ListenerOpts{
-		Contract: contract,
-		Logs: []generated.AbigenLog{
-			flux_aggregator_wrapper.FluxAggregatorNewRound{},
-			flux_aggregator_wrapper.FluxAggregatorAnswerUpdated{},
-		},
-	})
-	defer unsubscribe()
+	listenerA := helper.newLogListener("listenerA")
+	listenerB := helper.newLogListenerWithJobV2("listenerB")
+	helper.register(listenerA, contract, 1)
+	helper.register(listenerB, contract, 3)
 
-	chRawLogs := <-chchRawLogs
+	chRawLogs := <-helper.chchRawLogs
+	go func() {
+		for _, event := range events {
+			switch x := event.(type) {
+			case *models.Head:
+				(helper.lb).(httypes.HeadTrackable).OnNewLongestChain(context.Background(), *x)
+			case types.Log:
+				chRawLogs <- x
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+	}()
 
-	for _, log := range logs {
-		chRawLogs <- log
-	}
+	g.Eventually(func() []uint64 { return listenerA.getUniqueLogsBlockNumbers() }, 8*time.Second, cltest.DBPollingInterval).
+		Should(gomega.Equal([]uint64{0, 1, 2, 1, 2, 3, 3}))
+	g.Eventually(func() []uint64 { return listenerB.getUniqueLogsBlockNumbers() }, 8*time.Second, cltest.DBPollingInterval).
+		Should(gomega.Equal([]uint64{0, 1, 1, 2, 2}))
 
-	require.Eventually(t, func() bool {
-		recvdMu.Lock()
-		defer recvdMu.Unlock()
-		return len(recvd) == 5
-	}, 5*time.Second, 10*time.Millisecond)
-	requireBroadcastCount(t, store, 5)
+	helper.unsubscribeAll()
 
-	var recvdRawLogs []types.Log
-	for _, broadcast := range recvd {
-		recvdRawLogs = append(recvdRawLogs, broadcast.RawLog())
-	}
+	require.Equal(t, expectedA, listenerA.getUniqueLogs())
+	require.Equal(t, expectedB, listenerB.getUniqueLogs())
 
-	recvdMu.Lock()
-	defer recvdMu.Unlock()
-	require.Equal(t, expected, recvdRawLogs)
-
-	ethClient.AssertExpectations(t)
+	helper.mockEth.ethClient.AssertExpectations(t)
 }
 
 func TestBroadcaster_BackfillsForNewListeners(t *testing.T) {
-	store, cleanup := cltest.NewStore(t)
-	defer cleanup()
-
-	ethClient := new(mocks.Client)
-	sub := new(mocks.Subscription)
-	store.EthClient = ethClient
+	g := gomega.NewGomegaWithT(t)
 
 	const blockHeight int64 = 0
+	helper := newBroadcasterHelper(t, blockHeight, 2)
+	helper.mockEth.ethClient.On("HeadByNumber", mock.Anything, (*big.Int)(nil)).Return(&models.Head{Number: blockHeight}, nil).Times(2)
+	helper.mockEth.ethClient.On("FilterLogs", mock.Anything, mock.Anything).Return(nil, nil).Times(2)
 
-	chchRawLogs := make(chan chan<- types.Log, 1)
-	ethClient.On("SubscribeFilterLogs", mock.Anything, mock.Anything, mock.Anything).
-		Run(func(args mock.Arguments) { chchRawLogs <- args.Get(2).(chan<- types.Log) }).
-		Return(sub, nil).
-		Once()
-	ethClient.On("HeaderByNumber", mock.Anything, (*big.Int)(nil)).Return(&models.Head{Number: blockHeight}, nil)
-	ethClient.On("FilterLogs", mock.Anything, mock.Anything).Return([]types.Log{}, nil).Once()
-	sub.On("Unsubscribe").Return()
-	sub.On("Err").Return(nil)
+	helper.start()
+	defer helper.stop()
 
-	orm := log.NewORM(store.DB)
-	lb := log.NewBroadcaster(orm, store.EthClient, store.Config)
-	lb.Start()
-	defer lb.Stop()
+	addr1 := cltest.NewAddress()
+	contract, err := flux_aggregator_wrapper.NewFluxAggregator(addr1, nil)
+	require.NoError(t, err)
+
+	listener1 := helper.newLogListener("1")
+	listener2 := helper.newLogListener("2")
+
+	topics1 := []generated.AbigenLog{
+		flux_aggregator_wrapper.FluxAggregatorAnswerUpdated{},
+	}
+	helper.registerWithTopics(listener1, contract, topics1, 1)
+	require.Eventually(t, func() bool { return helper.mockEth.subscribeCallCount() == 1 }, 5*time.Second, 10*time.Millisecond)
+	g.Consistently(func() int32 { return helper.mockEth.subscribeCallCount() }).Should(gomega.Equal(int32(1)))
+
+	<-helper.chchRawLogs
+
+	topics2 := []generated.AbigenLog{
+		flux_aggregator_wrapper.FluxAggregatorNewRound{},
+	}
+	helper.registerWithTopics(listener2, contract, topics2, 1)
+	require.Eventually(t, func() bool { return helper.mockEth.subscribeCallCount() == 2 }, 5*time.Second, 10*time.Millisecond)
+	g.Consistently(func() int32 { return helper.mockEth.subscribeCallCount() }).Should(gomega.Equal(int32(2)))
+
+	helper.unsubscribeAll()
 }
 
-func pickLogs(t *testing.T, allLogs map[uint]types.Log, indices []uint) []types.Log {
+func pickLogs(allLogs map[uint]types.Log, indices []uint) []types.Log {
 	var picked []types.Log
 	for _, idx := range indices {
 		picked = append(picked, allLogs[idx])
@@ -1038,43 +1429,25 @@ func pickLogs(t *testing.T, allLogs map[uint]types.Log, indices []uint) []types.
 	return picked
 }
 
-type received struct {
-	logs []types.Log
-	sync.Mutex
-}
-
-func requireAllReceived(t *testing.T, expectedState, state *received) {
-	require.Eventually(t, func() bool {
-		state.Lock()
-		defer state.Unlock()
-		return len(state.logs) == len(expectedState.logs)
-	}, 10*time.Second, 10*time.Millisecond)
-
-	state.Lock()
-	for i := range expectedState.logs {
-		require.Equal(t, expectedState.logs[i], state.logs[i])
-	}
-	state.Unlock()
-}
-
 func requireBroadcastCount(t *testing.T, store *strpkg.Store, expectedCount int) {
 	t.Helper()
+	g := gomega.NewGomegaWithT(t)
 
-	comparisonFunc := func() bool {
+	comparisonFunc := func() int {
 		var count struct{ Count int }
 		err := store.DB.Raw(`SELECT count(*) FROM log_broadcasts`).Scan(&count).Error
 		require.NoError(t, err)
-		return count.Count == expectedCount
+		return count.Count
 	}
-	require.Eventually(t, comparisonFunc, 5*time.Second, 10*time.Millisecond)
+
+	g.Eventually(comparisonFunc, 5*time.Second, cltest.DBPollingInterval).Should(gomega.Equal(expectedCount))
+	g.Consistently(comparisonFunc).Should(gomega.Equal(expectedCount))
 }
 
-func handleLogBroadcast(t *testing.T, lb log.Broadcast) {
+func requireEqualLogs(t *testing.T, expectedLogs, actualLogs []types.Log) {
 	t.Helper()
-
-	consumed, err := lb.WasAlreadyConsumed()
-	require.NoError(t, err)
-	require.False(t, consumed)
-	err = lb.MarkConsumed()
-	require.NoError(t, err)
+	require.Equalf(t, len(expectedLogs), len(actualLogs), "log slices are not equal (len %v vs %v): expected(%v), actual(%v)", len(expectedLogs), len(actualLogs), expectedLogs, actualLogs)
+	for i := range expectedLogs {
+		require.Equalf(t, expectedLogs[i], actualLogs[i], "log slices are not equal (len %v vs %v): expected(%v), actual(%v)", len(expectedLogs), len(actualLogs), expectedLogs, actualLogs)
+	}
 }

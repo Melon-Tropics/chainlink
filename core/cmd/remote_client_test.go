@@ -1,21 +1,17 @@
 package cmd_test
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"math/big"
 	"os"
 	"strconv"
 	"testing"
 
+	"github.com/smartcontractkit/chainlink/core/logger"
 	"github.com/smartcontractkit/chainlink/core/services/job"
 	"github.com/smartcontractkit/chainlink/core/web"
-
-	"github.com/smartcontractkit/chainlink/core/services/eth"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/pelletier/go-toml"
@@ -23,9 +19,9 @@ import (
 	"github.com/smartcontractkit/chainlink/core/cmd"
 	"github.com/smartcontractkit/chainlink/core/internal/cltest"
 	"github.com/smartcontractkit/chainlink/core/internal/mocks"
+	webhookmocks "github.com/smartcontractkit/chainlink/core/services/webhook/mocks"
 	"github.com/smartcontractkit/chainlink/core/store/models"
 	"github.com/smartcontractkit/chainlink/core/store/presenters"
-	webpresenters "github.com/smartcontractkit/chainlink/core/web/presenters"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -72,12 +68,10 @@ func startNewApplication(t *testing.T, setup ...func(opts *startOptions)) *cltes
 
 	var app *cltest.TestApplication
 	var cleanup func()
-	if sopts.WithKey {
-		app, cleanup = cltest.NewApplicationWithConfigAndKey(t, config, sopts.FlagsAndDeps...)
-	} else {
-		app, cleanup = cltest.NewApplicationWithConfig(t, config, sopts.FlagsAndDeps...)
-	}
+	app, cleanup = cltest.NewApplicationWithConfigAndKey(t, config, sopts.FlagsAndDeps...)
 	t.Cleanup(cleanup)
+	app.Logger = app.Config.CreateProductionLogger()
+	app.Logger.SetDB(app.GetStore().DB)
 
 	if sopts.StartAndConnect {
 		require.NoError(t, app.StartAndConnect())
@@ -115,13 +109,13 @@ func startAndConnect() func(opts *startOptions) {
 	}
 }
 
-func newEthMocks(t *testing.T) (*mocks.RPCClient, *mocks.GethClient) {
+func newEthMock(t *testing.T) *mocks.Client {
 	t.Helper()
 
-	rpcClient, gethClient, _, assertMocksCalled := cltest.NewEthMocksWithStartupAssertions(t)
+	ethClient, _, assertMocksCalled := cltest.NewEthMocksWithStartupAssertions(t)
 	t.Cleanup(assertMocksCalled)
 
-	return rpcClient, gethClient
+	return ethClient
 }
 
 func keyNameForTest(t *testing.T) string {
@@ -265,7 +259,7 @@ func TestClient_CreateExternalInitiator(t *testing.T) {
 			c := cli.NewContext(nil, set, nil)
 
 			err := client.CreateExternalInitiator(c)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
 			var exi models.ExternalInitiator
 			err = app.Store.RawDBWithAdvisoryLock(func(db *gorm.DB) error {
@@ -360,7 +354,7 @@ func TestClient_CreateJobSpec(t *testing.T) {
 		{"bad filepath", "bad/filepath/", 0, true},
 		{"web", `{"initiators":[{"type":"web"}],"tasks":[{"type":"NoOp"}]}`, 1, false},
 		{"runAt", `{"initiators":[{"type":"runAt","params":{"time":"3000-01-08T18:12:01.103Z"}}],"tasks":[{"type":"NoOp"}]}`, 2, false},
-		{"file", "../internal/fixtures/web/end_at_job.json", 3, false},
+		{"file", "../testdata/jsonspecs/end_at_job.json", 3, false},
 	}
 
 	for _, test := range tests {
@@ -381,7 +375,7 @@ func TestClient_CreateJobSpec(t *testing.T) {
 func TestClient_ArchiveJobSpec(t *testing.T) {
 	t.Parallel()
 
-	eim := new(mocks.ExternalInitiatorManager)
+	eim := new(webhookmocks.ExternalInitiatorManager)
 	app := startNewApplication(t, withMocks(eim))
 	client, _ := app.NewClientAndRenderer()
 
@@ -392,7 +386,7 @@ func TestClient_ArchiveJobSpec(t *testing.T) {
 	set.Parse([]string{job.ID.String()})
 	c := cli.NewContext(nil, set, nil)
 
-	eim.On("DeleteJob", mock.Anything, mock.MatchedBy(func(id models.JobID) bool {
+	eim.On("DeleteJob", mock.MatchedBy(func(id models.JobID) bool {
 		return id.String() == job.ID.String()
 	})).Once().Return(nil)
 
@@ -463,112 +457,6 @@ func TestClient_CreateJobRun(t *testing.T) {
 	}
 }
 
-func TestClient_CreateBridge(t *testing.T) {
-	t.Parallel()
-
-	app := startNewApplication(t)
-	client, _ := app.NewClientAndRenderer()
-
-	tests := []struct {
-		name    string
-		param   string
-		errored bool
-	}{
-		{"EmptyString", "", true},
-		{"ValidString", `{ "name": "TestBridge", "url": "http://localhost:3000/randomNumber" }`, false},
-		{"InvalidString", `{ "noname": "", "nourl": "" }`, true},
-		{"InvalidChar", `{ "badname": "path/bridge", "nourl": "" }`, true},
-		{"ValidPath", "testdata/create_random_number_bridge_type.json", false},
-		{"InvalidPath", "bad/filepath/", true},
-	}
-
-	for _, tt := range tests {
-		test := tt
-		t.Run(test.name, func(t *testing.T) {
-
-			set := flag.NewFlagSet("bridge", 0)
-			set.Parse([]string{test.param})
-			c := cli.NewContext(nil, set, nil)
-			if test.errored {
-				assert.Error(t, client.CreateBridge(c))
-			} else {
-				assert.Nil(t, client.CreateBridge(c))
-			}
-		})
-	}
-}
-
-func TestClient_IndexBridges(t *testing.T) {
-	t.Parallel()
-
-	app := startNewApplication(t)
-	client, r := app.NewClientAndRenderer()
-
-	bt1 := &models.BridgeType{
-		Name:          models.MustNewTaskType("testingbridges1"),
-		URL:           cltest.WebURL(t, "https://testing.com/bridges"),
-		Confirmations: 0,
-	}
-	err := app.GetStore().CreateBridgeType(bt1)
-	require.NoError(t, err)
-
-	bt2 := &models.BridgeType{
-		Name:          models.MustNewTaskType("testingbridges2"),
-		URL:           cltest.WebURL(t, "https://testing.com/bridges"),
-		Confirmations: 0,
-	}
-	err = app.GetStore().CreateBridgeType(bt2)
-	require.NoError(t, err)
-
-	require.Nil(t, client.IndexBridges(cltest.EmptyCLIContext()))
-	bridges := *r.Renders[0].(*[]models.BridgeType)
-	require.Equal(t, 2, len(bridges))
-	assert.Equal(t, bt1.Name, bridges[0].Name)
-}
-
-func TestClient_ShowBridge(t *testing.T) {
-	t.Parallel()
-
-	app := startNewApplication(t)
-	client, r := app.NewClientAndRenderer()
-
-	bt := &models.BridgeType{
-		Name:          models.MustNewTaskType("testingbridges1"),
-		URL:           cltest.WebURL(t, "https://testing.com/bridges"),
-		Confirmations: 0,
-	}
-	require.NoError(t, app.GetStore().CreateBridgeType(bt))
-
-	set := flag.NewFlagSet("test", 0)
-	set.Parse([]string{bt.Name.String()})
-	c := cli.NewContext(nil, set, nil)
-	require.NoError(t, client.ShowBridge(c))
-	require.Len(t, r.Renders, 1)
-	assert.Equal(t, bt.Name, r.Renders[0].(*models.BridgeType).Name)
-}
-
-func TestClient_RemoveBridge(t *testing.T) {
-	t.Parallel()
-
-	app := startNewApplication(t)
-	client, r := app.NewClientAndRenderer()
-
-	bt := &models.BridgeType{
-		Name:          models.MustNewTaskType("testingbridges1"),
-		URL:           cltest.WebURL(t, "https://testing.com/bridges"),
-		Confirmations: 0,
-	}
-	err := app.GetStore().CreateBridgeType(bt)
-	require.NoError(t, err)
-
-	set := flag.NewFlagSet("test", 0)
-	set.Parse([]string{bt.Name.String()})
-	c := cli.NewContext(nil, set, nil)
-	require.NoError(t, client.RemoveBridge(c))
-	require.Len(t, r.Renders, 1)
-	assert.Equal(t, bt.Name, r.Renders[0].(*models.BridgeType).Name)
-}
-
 func TestClient_RemoteLogin(t *testing.T) {
 	t.Parallel()
 
@@ -607,40 +495,6 @@ func TestClient_RemoteLogin(t *testing.T) {
 	}
 }
 
-func TestClient_SendEther_From_BPTXM(t *testing.T) {
-	t.Parallel()
-
-	rpcClient, gethClient := newEthMocks(t)
-	oca := common.HexToAddress("0xDEADB3333333F")
-	app := startNewApplication(t,
-		withKey(),
-		withConfig(map[string]interface{}{
-			"OPERATOR_CONTRACT_ADDRESS": &oca,
-		}),
-		withMocks(eth.NewClientWith(rpcClient, gethClient)),
-		startAndConnect(),
-	)
-	client, _ := app.NewClientAndRenderer()
-	s := app.GetStore()
-
-	set := flag.NewFlagSet("sendether", 0)
-	amount := "100.5"
-	_, fromAddress := cltest.MustAddRandomKeyToKeystore(t, s, 0)
-	to := "0x342156c8d3bA54Abc67920d35ba1d1e67201aC9C"
-	set.Parse([]string{amount, fromAddress.Hex(), to})
-
-	cliapp := cli.NewApp()
-	c := cli.NewContext(cliapp, set, nil)
-
-	assert.NoError(t, client.SendEther(c))
-
-	etx := models.EthTx{}
-	require.NoError(t, s.DB.First(&etx).Error)
-	require.Equal(t, "100.500000000000000000", etx.Value.String())
-	require.Equal(t, fromAddress, etx.FromAddress)
-	require.Equal(t, to, etx.ToAddress.Hex())
-}
-
 func TestClient_ChangePassword(t *testing.T) {
 	t.Parallel()
 
@@ -676,106 +530,17 @@ func TestClient_ChangePassword(t *testing.T) {
 	require.Contains(t, err.Error(), "Unauthorized")
 }
 
-func TestClient_IndexTransactions(t *testing.T) {
-	t.Parallel()
-
-	app := startNewApplication(t)
-	client, r := app.NewClientAndRenderer()
-
-	store := app.GetStore()
-	_, from := cltest.MustAddRandomKeyToKeystore(t, store)
-
-	tx := cltest.MustInsertConfirmedEthTxWithAttempt(t, store, 0, 1, from)
-	attempt := tx.EthTxAttempts[0]
-
-	// page 1
-	set := flag.NewFlagSet("test transactions", 0)
-	set.Int("page", 1, "doc")
-	c := cli.NewContext(nil, set, nil)
-	require.Equal(t, 1, c.Int("page"))
-	assert.NoError(t, client.IndexTransactions(c))
-
-	renderedTxs := *r.Renders[0].(*[]webpresenters.EthTxResource)
-	assert.Equal(t, 1, len(renderedTxs))
-	assert.Equal(t, attempt.Hash.Hex(), renderedTxs[0].Hash.Hex())
-
-	// page 2 which doesn't exist
-	set = flag.NewFlagSet("test txattempts", 0)
-	set.Int("page", 2, "doc")
-	c = cli.NewContext(nil, set, nil)
-	require.Equal(t, 2, c.Int("page"))
-	assert.NoError(t, client.IndexTransactions(c))
-
-	renderedTxs = *r.Renders[1].(*[]webpresenters.EthTxResource)
-	assert.Equal(t, 0, len(renderedTxs))
-}
-
-func TestClient_ShowTransaction(t *testing.T) {
-	t.Parallel()
-
-	app := startNewApplication(t)
-	client, r := app.NewClientAndRenderer()
-
-	store := app.GetStore()
-	_, from := cltest.MustAddRandomKeyToKeystore(t, store)
-
-	tx := cltest.MustInsertConfirmedEthTxWithAttempt(t, store, 0, 1, from)
-	attempt := tx.EthTxAttempts[0]
-
-	set := flag.NewFlagSet("test get tx", 0)
-	set.Parse([]string{attempt.Hash.Hex()})
-	c := cli.NewContext(nil, set, nil)
-	assert.NoError(t, client.ShowTransaction(c))
-
-	renderedTx := *r.Renders[0].(*webpresenters.EthTxResource)
-	assert.Equal(t, &tx.FromAddress, renderedTx.From)
-}
-
-func TestClient_IndexTxAttempts(t *testing.T) {
-	t.Parallel()
-
-	app := startNewApplication(t)
-	client, r := app.NewClientAndRenderer()
-
-	store := app.GetStore()
-	_, from := cltest.MustAddRandomKeyToKeystore(t, store)
-
-	tx := cltest.MustInsertConfirmedEthTxWithAttempt(t, store, 0, 1, from)
-
-	// page 1
-	set := flag.NewFlagSet("test txattempts", 0)
-	set.Int("page", 1, "doc")
-	c := cli.NewContext(nil, set, nil)
-	require.Equal(t, 1, c.Int("page"))
-	assert.NoError(t, client.IndexTxAttempts(c))
-
-	renderedAttempts := *r.Renders[0].(*[]webpresenters.EthTxResource)
-	require.Len(t, tx.EthTxAttempts, 1)
-	assert.Equal(t, tx.EthTxAttempts[0].Hash.Hex(), renderedAttempts[0].Hash.Hex())
-
-	// page 2 which doesn't exist
-	set = flag.NewFlagSet("test transactions", 0)
-	set.Int("page", 2, "doc")
-	c = cli.NewContext(nil, set, nil)
-	require.Equal(t, 2, c.Int("page"))
-	assert.NoError(t, client.IndexTxAttempts(c))
-
-	renderedAttempts = *r.Renders[1].(*[]webpresenters.EthTxResource)
-	assert.Equal(t, 0, len(renderedAttempts))
-}
-
 func TestClient_SetMinimumGasPrice(t *testing.T) {
 	t.Parallel()
 
 	// Setup Withdrawals application
-	rpcClient, gethClient := newEthMocks(t)
 	oca := common.HexToAddress("0xDEADB3333333F")
 	app := startNewApplication(t,
 		withKey(),
 		withConfig(map[string]interface{}{
 			"OPERATOR_CONTRACT_ADDRESS": &oca,
 		}),
-		withMocks(eth.NewClientWith(rpcClient, gethClient)),
+		withMocks(newEthMock(t)),
 		startAndConnect(),
 	)
 	client, _ := app.NewClientAndRenderer()
@@ -857,7 +622,7 @@ func TestClient_RunOCRJob_HappyPath(t *testing.T) {
 	require.NoError(t, app.Store.DB.Create(bridge2).Error)
 
 	var ocrJobSpecFromFile job.Job
-	tree, err := toml.LoadFile("testdata/oracle-spec.toml")
+	tree, err := toml.LoadFile("../testdata/tomlspecs/oracle-spec.toml")
 	require.NoError(t, err)
 	err = tree.Unmarshal(&ocrJobSpecFromFile)
 	require.NoError(t, err)
@@ -905,49 +670,6 @@ func TestClient_RunOCRJob_JobNotFound(t *testing.T) {
 	assert.EqualError(t, client.TriggerPipelineRun(c), "parseResponse error: Error; job ID 1: record not found")
 }
 
-func TestClient_ListJobsV2(t *testing.T) {
-	t.Parallel()
-
-	app := startNewApplication(t)
-	client, r := app.NewClientAndRenderer()
-
-	// Create the job
-	toml, err := ioutil.ReadFile("./testdata/direct-request-spec.toml")
-	assert.NoError(t, err)
-
-	request, err := json.Marshal(models.CreateJobSpecRequest{
-		TOML: string(toml),
-	})
-	assert.NoError(t, err)
-
-	resp, err := client.HTTP.Post("/v2/jobs", bytes.NewReader(request))
-	assert.NoError(t, err)
-
-	responseBodyBytes, err := ioutil.ReadAll(resp.Body)
-	assert.NoError(t, err)
-
-	job := cmd.Job{}
-	err = web.ParseJSONAPIResponse(responseBodyBytes, &job)
-	assert.NoError(t, err)
-
-	require.Nil(t, client.ListJobsV2(cltest.EmptyCLIContext()))
-	jobs := *r.Renders[0].(*[]cmd.Job)
-	require.Equal(t, 1, len(jobs))
-	assert.Equal(t, job.ID, jobs[0].ID)
-}
-
-func TestClient_CreateJobV2(t *testing.T) {
-	t.Parallel()
-
-	app := startNewApplication(t)
-	client, _ := app.NewClientAndRenderer()
-
-	fs := flag.NewFlagSet("", flag.ExitOnError)
-	fs.Parse([]string{"./testdata/ocr-bootstrap-spec.toml"})
-	err := client.CreateJobV2(cli.NewContext(nil, fs, nil))
-	require.NoError(t, err)
-}
-
 func TestClient_AutoLogin(t *testing.T) {
 	t.Parallel()
 
@@ -966,6 +688,11 @@ func TestClient_AutoLogin(t *testing.T) {
 
 	fs := flag.NewFlagSet("", flag.ExitOnError)
 	err := client.ListJobsV2(cli.NewContext(nil, fs, nil))
+	require.NoError(t, err)
+
+	// Expire the session and then try again
+	require.NoError(t, app.GetStore().ORM.DB.Exec("delete from sessions;").Error)
+	err = client.ListJobsV2(cli.NewContext(nil, fs, nil))
 	require.NoError(t, err)
 }
 
@@ -1001,4 +728,25 @@ func TestClient_SetLogConfig(t *testing.T) {
 	err = client.SetLogSQL(c)
 	assert.NoError(t, err)
 	assert.Equal(t, sqlEnabled, app.Config.LogSQLStatements())
+}
+
+func TestClient_SetPkgLogLevel(t *testing.T) {
+	t.Parallel()
+
+	app := startNewApplication(t)
+	client, _ := app.NewClientAndRenderer()
+
+	logPkg := logger.HeadTracker
+	logLevel := "warn"
+	set := flag.NewFlagSet("logpkg", 0)
+	set.String("pkg", logPkg, "")
+	set.String("level", logLevel, "")
+	c := cli.NewContext(nil, set, nil)
+
+	err := client.SetLogPkg(c)
+	require.NoError(t, err)
+
+	level, err := app.Logger.ServiceLogLevel(logPkg)
+	require.NoError(t, err)
+	assert.Equal(t, logLevel, level)
 }

@@ -2,6 +2,7 @@ import TOML from '@iarna/toml'
 import { PipelineTaskError, RunStatus } from 'core/store/models'
 import { TaskSpec } from 'core/store/models'
 import { parseDot, Stratify } from './parseDot'
+import { countBy as _countBy } from 'lodash'
 
 export enum JobSpecFormats {
   JSON = 'json',
@@ -83,7 +84,7 @@ export function getOcrJobStatus({
 
 // `isNaN` actually accepts strings and we don't want to `parseInt` or `parseFloat`
 //  as it doesn't have the behaviour we want.
-export const isOcrJob = (jobSpecId: string): boolean =>
+export const isJobV2 = (jobSpecId: string): boolean =>
   !isNaN((jobSpecId as unknown) as number)
 
 export function getTaskList({
@@ -93,9 +94,11 @@ export function getTaskList({
 }): {
   list: false | TaskSpec[] | Stratify[]
   format: false | JobSpecFormats
+  error: string
 } {
   const format = getJobSpecFormat({ value })
   let list: false | TaskSpec[] | Stratify[] = false
+  let error = ''
 
   if (format === JobSpecFormats.JSON) {
     const tasks = JSON.parse(value).tasks
@@ -111,6 +114,22 @@ export function getTaskList({
         observationSource.some((node) => !node.parentIds.length)
           ? observationSource
           : false
+      if (list) {
+        list.every((listItem) => {
+          const obj = _countBy(listItem.parentIds)
+          Object.entries(obj).every(([parentId, value]) => {
+            if (value > 1) {
+              error += `${parentId} has duplicate ${listItem.id} children`
+              list = false
+              return false
+            }
+
+            return true
+          })
+
+          return !error
+        })
+      }
     } catch {
       list = false
     }
@@ -119,5 +138,6 @@ export function getTaskList({
   return {
     list,
     format,
+    error,
   }
 }

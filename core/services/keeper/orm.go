@@ -3,26 +3,28 @@ package keeper
 import (
 	"context"
 
-	"github.com/pkg/errors"
-	"github.com/smartcontractkit/chainlink/core/logger"
-	"github.com/smartcontractkit/chainlink/core/utils"
+	"github.com/smartcontractkit/chainlink/core/services/bulletprooftxmanager"
+	"github.com/smartcontractkit/chainlink/core/services/keystore/keys/ethkey"
+	"github.com/smartcontractkit/chainlink/core/store/orm"
+
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
-const (
-	gasBuffer         = int32(200_000)
-	maxUnconfirmedTXs = uint64(5)
-)
-
-func NewORM(db *gorm.DB) ORM {
+func NewORM(db *gorm.DB, txm transmitter, config orm.ConfigReader, strategy bulletprooftxmanager.TxStrategy) ORM {
 	return ORM{
-		DB: db,
+		DB:       db,
+		txm:      txm,
+		config:   config,
+		strategy: strategy,
 	}
 }
 
 type ORM struct {
-	DB *gorm.DB
+	DB       *gorm.DB
+	txm      transmitter
+	config   orm.ConfigReader
+	strategy bulletprooftxmanager.TxStrategy
 }
 
 func (korm ORM) Registries(ctx context.Context) (registries []Registry, _ error) {
@@ -65,39 +67,42 @@ func (korm ORM) UpsertUpkeep(ctx context.Context, registration *UpkeepRegistrati
 		Error
 }
 
-func (korm ORM) BatchDeleteUpkeepsForJob(ctx context.Context, jobID int32, upkeedIDs []int64) error {
-	return korm.DB.
+func (korm ORM) BatchDeleteUpkeepsForJob(ctx context.Context, jobID int32, upkeedIDs []int64) (int64, error) {
+	exec := korm.DB.
 		WithContext(ctx).Exec(
 		`DELETE FROM upkeep_registrations WHERE registry_id = (
 			SELECT id from keeper_registries where job_id = ?
 		) AND upkeep_id IN (?)`,
 		jobID,
 		upkeedIDs,
-	).Error
+	)
+	return exec.RowsAffected, exec.Error
 }
 
-func (korm ORM) EligibleUpkeeps(
+func (korm ORM) EligibleUpkeepsForRegistry(
 	ctx context.Context,
+	registryAddress ethkey.EIP55Address,
 	blockNumber int64,
 	gracePeriod int64,
 ) (upkeeps []UpkeepRegistration, _ error) {
-	lastValidBlockHeight := blockNumber - gracePeriod
-	if lastValidBlockHeight < 1 {
-		lastValidBlockHeight = 1 // ensure that upkeeps with last_run_block_height = 0 are always eligible
-	}
 	err := korm.DB.
 		WithContext(ctx).
 		Preload("Registry").
+		Order("upkeep_registrations.id ASC, upkeep_registrations.upkeep_id ASC").
 		Joins("INNER JOIN keeper_registries ON keeper_registries.id = upkeep_registrations.registry_id").
 		Where(`
-			? % keeper_registries.block_count_per_turn = 0 AND
+			keeper_registries.contract_address = ? AND
 			keeper_registries.num_keepers > 0 AND
-			upkeep_registrations.last_run_block_height < ? AND
-			keeper_registries.keeper_index =
 			(
-				upkeep_registrations.positioning_constant + (? / keeper_registries.block_count_per_turn)
+				upkeep_registrations.last_run_block_height = 0 OR (
+					upkeep_registrations.last_run_block_height + ? < ? AND
+					upkeep_registrations.last_run_block_height < (? - (? % keeper_registries.block_count_per_turn))
+				)
+			) AND
+			keeper_registries.keeper_index = (
+				upkeep_registrations.positioning_constant + ((? - (? % keeper_registries.block_count_per_turn)) / keeper_registries.block_count_per_turn)
 			) % keeper_registries.num_keepers
-		`, blockNumber, lastValidBlockHeight, blockNumber).
+		`, registryAddress, gracePeriod, blockNumber, blockNumber, blockNumber, blockNumber, blockNumber).
 		Find(&upkeeps).
 		Error
 
@@ -117,64 +122,23 @@ func (korm ORM) LowestUnsyncedID(ctx context.Context, reg Registry) (nextID int6
 	return nextID, err
 }
 
-func (korm ORM) SetLastRunHeightForUpkeepOnJob(ctx context.Context, jobID int32, upkeepID int64, height int64) error {
-	return korm.DB.
-		WithContext(ctx).Exec(
-		`UPDATE upkeep_registrations
+func (korm ORM) SetLastRunHeightForUpkeepOnJob(db *gorm.DB, jobID int32, upkeepID int64, height int64) error {
+	return db.
+		Exec(`UPDATE upkeep_registrations
 		SET last_run_block_height = ?
 		WHERE upkeep_id = ? AND
 		registry_id = (
 			SELECT id FROM keeper_registries WHERE job_id = ?
 		);`,
-		height,
-		upkeepID,
-		jobID,
-	).Error
+			height,
+			upkeepID,
+			jobID,
+		).Error
 }
 
-func (korm ORM) CreateEthTransactionForUpkeep(ctx context.Context, upkeep UpkeepRegistration, payload []byte) error {
-	sqlDB, err := korm.DB.DB()
-	if err != nil {
-		return err
-	}
-
+func (korm ORM) CreateEthTransactionForUpkeep(tx *gorm.DB, upkeep UpkeepRegistration, payload []byte) (bulletprooftxmanager.EthTx, error) {
 	from := upkeep.Registry.FromAddress.Address()
-	err = utils.CheckOKToTransmit(ctx, sqlDB, from, maxUnconfirmedTXs)
-	if err != nil {
-		return errors.Wrap(err, "transmitter#CreateEthTransaction")
-	}
-
-	value := 0
-	res, err := sqlDB.ExecContext(ctx, `
-		INSERT INTO eth_txes (from_address, to_address, encoded_payload, value, gas_limit, state, created_at)
-		SELECT $1,$2,$3,$4,$5,'unstarted',NOW()
-		WHERE NOT EXISTS (
-			SELECT 1 FROM eth_tx_attempts
-			JOIN eth_txes ON eth_txes.id = eth_tx_attempts.eth_tx_id
-			WHERE eth_txes.from_address = $1
-				AND eth_txes.state = 'unconfirmed'
-				AND eth_tx_attempts.state = 'insufficient_eth'
-		);`,
-		from,
-		upkeep.Registry.ContractAddress.Address(),
-		payload,
-		value,
-		upkeep.ExecuteGas+gasBuffer,
-	)
-
-	if err != nil {
-		return errors.Wrap(err, "keeper failed to insert eth_tx")
-	}
-
-	rowsAffected, err := res.RowsAffected()
-	if err != nil {
-		return errors.Wrap(err, "transmitter failed to get RowsAffected on eth_tx insert")
-	}
-	if rowsAffected == 0 {
-		err := errors.Errorf("Skipped upkeep because wallet is out of eth: %s", from.Hex())
-		logger.Warnw(err.Error())
-		return err
-	}
-
-	return nil
+	to := upkeep.Registry.ContractAddress.Address()
+	gasLimit := upkeep.ExecuteGas + korm.config.KeeperRegistryPerformGasOverhead()
+	return korm.txm.CreateEthTransaction(tx, from, to, payload, gasLimit, nil, korm.strategy)
 }

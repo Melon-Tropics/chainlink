@@ -5,13 +5,14 @@ import (
 	"testing"
 	"time"
 
+	uuid "github.com/satori/go.uuid"
+
 	"github.com/lib/pq"
 
 	"github.com/smartcontractkit/chainlink/core/services/offchainreporting"
 
 	"gopkg.in/guregu/null.v4"
 
-	"github.com/smartcontractkit/chainlink/core/services/pipeline"
 	"github.com/smartcontractkit/chainlink/core/store/models"
 	"gorm.io/gorm"
 
@@ -77,7 +78,7 @@ ds1 -> ds1_parse -> ds1_multiply;
 		contractAddress    = "%s"
 		p2pPeerID          = "%s"
 		p2pBootstrapPeers  = ["/dns4/chain.link/tcp/1234/p2p/16Uiu2HAm58SP7UL8zsnpeuwHfytLocaqgnyaYKP8wu7qRdrixLju"]
-		isBootstrapPeer    = false 
+		isBootstrapPeer    = false
 		transmitterAddress = "%s"
 		keyBundleID = "%s"
 		observationTimeout = "10s"
@@ -140,7 +141,7 @@ func makeOCRJobSpec(t *testing.T, transmitterAddress common.Address) *job.Job {
 	jobSpecText := fmt.Sprintf(ocrJobSpecText, cltest.NewAddress().Hex(), peerID.String(), ocrKeyID, transmitterAddress.Hex())
 
 	dbSpec := job.Job{
-		Pipeline: *pipeline.NewTaskDAG(),
+		ExternalJobID: uuid.NewV4(),
 	}
 	err := toml.Unmarshal([]byte(jobSpecText), &dbSpec)
 	require.NoError(t, err)
@@ -183,9 +184,9 @@ func makeMinimalHTTPOracleSpec(t *testing.T, contractAddress, peerID, transmitte
 	}
 	var os = job.Job{
 		Name:          null.NewString("a job", true),
-		Pipeline:      *pipeline.NewTaskDAG(),
 		Type:          job.OffchainReporting,
 		SchemaVersion: 1,
+		ExternalJobID: uuid.NewV4(),
 	}
 	s := fmt.Sprintf(minimalNonBootstrapTemplate, contractAddress, peerID, transmitterAddress, keyBundle, fetchUrl, timeout)
 	c, cl := cltest.NewConfig(t)
@@ -227,7 +228,7 @@ func makeOCRJobSpecFromToml(t *testing.T, db *gorm.DB, jobSpecToml string) *job.
 	t.Helper()
 
 	var jb = job.Job{
-		Pipeline: *pipeline.NewTaskDAG(),
+		ExternalJobID: uuid.NewV4(),
 	}
 	err := toml.Unmarshal([]byte(jobSpecToml), &jb)
 	require.NoError(t, err)

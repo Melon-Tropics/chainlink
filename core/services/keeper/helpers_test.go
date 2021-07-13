@@ -1,17 +1,15 @@
 package keeper
 
-import (
-	"github.com/smartcontractkit/chainlink/core/store/models"
-)
+import "github.com/ethereum/go-ethereum"
 
 func (rs *RegistrySynchronizer) ExportedFullSync() {
 	rs.fullSync()
 }
 
-func (rs *RegistrySynchronizer) ExportedProcessLogs(head models.Head) {
-	rs.processLogs(head)
+func (rs *RegistrySynchronizer) ExportedProcessLogs() {
+	rs.processLogs()
 }
 
-func ExportedCalcPositioningConstant(upkeepID int64, registryAddress models.EIP55Address) (int32, error) {
-	return calcPositioningConstant(upkeepID, registryAddress)
+func (executer *UpkeepExecuter) ExportedConstructCheckUpkeepCallMsg(upkeep UpkeepRegistration) (ethereum.CallMsg, error) {
+	return executer.constructCheckUpkeepCallMsg(upkeep)
 }

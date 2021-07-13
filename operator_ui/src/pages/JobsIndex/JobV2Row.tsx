@@ -21,6 +21,12 @@ export const JobV2Row = withStyles(tableStyles)(({ job, classes }: Props) => {
         return job.attributes.offChainReportingOracleSpec.createdAt
       case 'keeper':
         return job.attributes.keeperSpec.createdAt
+      case 'cron':
+        return job.attributes.cronSpec.createdAt
+      case 'webhook':
+        return job.attributes.webhookSpec.createdAt
+      case 'vrf':
+        return job.attributes.vrfSpec.createdAt
     }
   }, [job])
 
@@ -33,6 +39,12 @@ export const JobV2Row = withStyles(tableStyles)(({ job, classes }: Props) => {
         return 'Off-chain reporting'
       case 'keeper':
         return 'Keeper'
+      case 'cron':
+        return 'Cron'
+      case 'webhook':
+        return 'Webhook'
+      case 'vrf':
+        return 'VRF'
       default:
         return ''
     }
@@ -44,7 +56,10 @@ export const JobV2Row = withStyles(tableStyles)(({ job, classes }: Props) => {
         return 'fluxmonitor'
       case 'directrequest':
         return job.attributes.directRequestSpec.initiator
+      case 'vrf':
       case 'keeper':
+      case 'cron':
+      case 'webhook':
       case 'offchainreporting':
         return 'N/A'
       default:

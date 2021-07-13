@@ -13,7 +13,7 @@ import { JobsErrors } from './Errors'
 import { RecentRuns } from './RecentRuns'
 import { RegionalNav } from './RegionalNav'
 import { Runs as JobRuns } from './Runs'
-import { isOcrJob } from './utils'
+import { isJobV2 } from './utils'
 import {
   transformDirectRequestJobRun,
   transformPipelineJobRun,
@@ -33,7 +33,7 @@ export const JobsShow = () => {
     recentRuns: [],
     recentRunsCount: 0,
   })
-  const { job, jobSpec } = state
+  const { job, jobSpec, externalJobID } = state
   const { error, ErrorComponent, setError } = useErrorHandler()
   const { LoadingPlaceholder } = useLoadingPlaceholder(!error && !jobSpec)
 
@@ -44,7 +44,7 @@ export const JobsShow = () => {
         page,
         size,
       }
-      if (isOcrJob(jobSpecId)) {
+      if (isJobV2(jobSpecId)) {
         return v2.ocrRuns
           .getJobSpecRuns(requestParams)
           .then((jobSpecRunsResponse) => {
@@ -76,30 +76,36 @@ export const JobsShow = () => {
   )
 
   const getJobSpec = React.useCallback(async () => {
-    if (isOcrJob(jobSpecId)) {
+    if (isJobV2(jobSpecId)) {
       return v2.jobs
         .getJobSpec(jobSpecId)
         .then((response) => {
           const jobSpec = response.data
           setState((s) => {
             let createdAt: string
+            const externalJobID = jobSpec.attributes.externalJobID
             switch (jobSpec.attributes.type) {
               case 'offchainreporting':
                 createdAt =
                   jobSpec.attributes.offChainReportingOracleSpec.createdAt
-
                 break
               case 'fluxmonitor':
                 createdAt = jobSpec.attributes.fluxMonitorSpec.createdAt
-
                 break
               case 'directrequest':
                 createdAt = jobSpec.attributes.directRequestSpec.createdAt
-
                 break
               case 'keeper':
                 createdAt = jobSpec.attributes.keeperSpec.createdAt
-
+                break
+              case 'cron':
+                createdAt = jobSpec.attributes.cronSpec.createdAt
+                break
+              case 'webhook':
+                createdAt = jobSpec.attributes.webhookSpec.createdAt
+                break
+              case 'vrf':
+                createdAt = jobSpec.attributes.vrfSpec.createdAt
                 break
             }
 
@@ -118,6 +124,7 @@ export const JobsShow = () => {
               ...s,
               jobSpec,
               job,
+              externalJobID,
             }
           })
         })
@@ -150,6 +157,7 @@ export const JobsShow = () => {
     <div>
       <RegionalNav
         jobSpecId={jobSpecId}
+        externalJobID={externalJobID}
         job={job}
         getJobSpecRuns={getJobSpecRuns}
         runsCount={state.recentRunsCount}

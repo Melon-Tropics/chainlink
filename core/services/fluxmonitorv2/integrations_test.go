@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/smartcontractkit/chainlink/core/web"
+
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -27,6 +29,7 @@ import (
 	faw "github.com/smartcontractkit/chainlink/core/internal/gethwrappers/generated/flux_aggregator_wrapper"
 	"github.com/smartcontractkit/chainlink/core/internal/gethwrappers/generated/link_token_interface"
 	"github.com/smartcontractkit/chainlink/core/services/fluxmonitorv2"
+	"github.com/smartcontractkit/chainlink/core/services/keystore/keys/ethkey"
 	"github.com/smartcontractkit/chainlink/core/services/pipeline"
 	"github.com/smartcontractkit/chainlink/core/store/models"
 	"github.com/smartcontractkit/chainlink/core/store/orm"
@@ -49,7 +52,7 @@ var emptyList = []common.Address{}
 // fluxAggregatorUniverse represents the universe with which the aggregator
 // contract interacts
 type fluxAggregatorUniverse struct {
-	key                       models.Key
+	key                       ethkey.Key
 	aggregatorContract        *faw.FluxAggregator
 	aggregatorContractAddress common.Address
 	linkContract              *link_token_interface.LinkToken
@@ -99,7 +102,7 @@ func setupFluxAggregatorUniverse(t *testing.T, configOptions ...func(cfg *fluxAg
 	}
 
 	key := cltest.MustGenerateRandomKey(t)
-	k, err := keystore.DecryptKey(key.JSON.Bytes(), cltest.Password)
+	k, err := keystore.DecryptKey(key.JSON.RawMessage[:], cltest.Password)
 	require.NoError(t, err)
 	oracleTransactor := cltest.MustNewSimulatedBackendKeyedTransactor(t, k.PrivateKey)
 
@@ -381,11 +384,11 @@ func assertNoSubmission(t *testing.T,
 func assertPipelineRunCreated(t *testing.T, db *gorm.DB, roundID int64, result float64) {
 	// Fetch the stats to extract the run id
 	stats := fluxmonitorv2.FluxMonitorRoundStatsV2{}
-	db.Where("round_id = ?", roundID).Find(&stats)
+	require.NoError(t, db.Where("round_id = ?", roundID).Find(&stats).Error)
 
 	// Verify the pipeline run data
 	run := pipeline.Run{}
-	db.Find(&run, stats.PipelineRunID)
+	require.NoError(t, db.Find(&run, stats.PipelineRunID).Error, "runID %v", stats.PipelineRunID)
 	assert.Equal(t, []interface{}{result}, run.Outputs.Val)
 }
 
@@ -447,7 +450,6 @@ func TestFluxMonitor_Deviation(t *testing.T) {
 	schemaVersion     = 1
 	name              = "integration test"
 	contractAddress   = "%s"
-	precision = 0
 	threshold = 2.0
 	absoluteThreshold = 0.0
 
@@ -467,7 +469,7 @@ func TestFluxMonitor_Deviation(t *testing.T) {
 
 	s = fmt.Sprintf(s, fa.aggregatorContractAddress, pollTimerPeriod)
 
-	requestBody, err := json.Marshal(models.CreateJobSpecRequest{
+	requestBody, err := json.Marshal(web.CreateJobRequest{
 		TOML: string(s),
 	})
 	assert.NoError(t, err)
@@ -559,7 +561,6 @@ type              = "fluxmonitor"
 schemaVersion     = 1
 name              = "example flux monitor spec"
 contractAddress   = "%s"
-precision = 2
 threshold = 0.5
 absoluteThreshold = 0.0
 
@@ -584,7 +585,7 @@ ds1 -> ds1_parse
 	fa.flagsContract.RaiseFlag(fa.sergey, fa.aggregatorContractAddress)
 	fa.backend.Commit()
 
-	requestBody, err := json.Marshal(models.CreateJobSpecRequest{
+	requestBody, err := json.Marshal(web.CreateJobRequest{
 		TOML: string(s),
 	})
 	assert.NoError(t, err)
@@ -600,6 +601,15 @@ ds1 -> ds1_parse
 		isNewRound:      true,
 		completesAnswer: false,
 	})
+
+	// Waiting for flux monitor to finish Register process in log broadcaster
+	// and then to have log broadcaster backfill logs after the debounceResubscribe period of ~ 1 sec
+	assert.Eventually(t, func() bool {
+		return app.LogBroadcaster.TrackedAddressesCount() >= 2
+	}, 3*time.Second, 200*time.Millisecond)
+
+	// Finally, the logs from log broadcaster are sent only after a next block is received.
+	fa.backend.Commit()
 
 	// Wait for the node's submission, and ensure it submits to the round
 	// started by the fake node
@@ -654,7 +664,6 @@ type              = "fluxmonitor"
 schemaVersion     = 1
 name              = "example flux monitor spec"
 contractAddress   = "%s"
-precision = 0
 threshold = 0.5
 absoluteThreshold = 0.0
 
@@ -679,7 +688,7 @@ ds1 -> ds1_parse
 	fa.flagsContract.RaiseFlag(fa.sergey, fa.aggregatorContractAddress)
 	fa.backend.Commit()
 
-	requestBody, err := json.Marshal(models.CreateJobSpecRequest{
+	requestBody, err := json.Marshal(web.CreateJobRequest{
 		TOML: string(s),
 	})
 	assert.NoError(t, err)
@@ -698,11 +707,10 @@ ds1 -> ds1_parse
 	reportPrice = int64(2) // change in price should trigger run
 	awaitSubmission(t, submissionReceived)
 
-	// lower contract's flag - should have no effect (but currently does)
-	// TODO - https://www.pivotaltracker.com/story/show/175419789
+	// lower contract's flag - should have no effect
 	fa.flagsContract.LowerFlags(fa.sergey, []common.Address{fa.aggregatorContractAddress})
 	fa.backend.Commit()
-	awaitSubmission(t, submissionReceived)
+	assertNoSubmission(t, submissionReceived, 5*pollTimerPeriod, "should not trigger a new run because FM is already hibernating")
 
 	// change in price should trigger run
 	reportPrice = int64(4)
@@ -723,7 +731,7 @@ ds1 -> ds1_parse
 
 	// change in price should not trigger run
 	reportPrice = int64(8)
-	assertNoSubmission(t, submissionReceived, 5*time.Second, "should not trigger a new run, while flag is raised")
+	assertNoSubmission(t, submissionReceived, 5*pollTimerPeriod, "should not trigger a new run, while flag is raised")
 }
 
 func TestFluxMonitor_InvalidSubmission(t *testing.T) {
@@ -762,7 +770,6 @@ type              = "fluxmonitor"
 schemaVersion     = 1
 name              = "example flux monitor spec"
 contractAddress   = "%s"
-precision = %d
 threshold = 0.5
 absoluteThreshold = 0.01
 
@@ -780,14 +787,14 @@ ds1 -> ds1_parse
 """
 `
 
-	s := fmt.Sprintf(toml, fa.aggregatorContractAddress, 8, "100ms", mockServer.URL)
+	s := fmt.Sprintf(toml, fa.aggregatorContractAddress, "100ms", mockServer.URL)
 
 	// raise flags
 	fa.flagsContract.RaiseFlag(fa.sergey, utils.ZeroAddress) // global kill switch
 	fa.flagsContract.RaiseFlag(fa.sergey, fa.aggregatorContractAddress)
 	fa.backend.Commit()
 
-	requestBody, err := json.Marshal(models.CreateJobSpecRequest{
+	requestBody, err := json.Marshal(web.CreateJobRequest{
 		TOML: string(s),
 	})
 	assert.NoError(t, err)
@@ -867,7 +874,6 @@ type              = "fluxmonitor"
 schemaVersion     = 1
 name              = "example flux monitor spec"
 contractAddress   = "%s"
-precision = 2
 threshold = 0.5
 absoluteThreshold = 0.0
 
@@ -887,7 +893,7 @@ ds1 -> ds1_parse -> ds1_multiply
 	`
 
 	s = fmt.Sprintf(s, fa.aggregatorContractAddress, "200ms", mockServer.URL)
-	requestBody, err := json.Marshal(models.CreateJobSpecRequest{
+	requestBody, err := json.Marshal(web.CreateJobRequest{
 		TOML: string(s),
 	})
 	assert.NoError(t, err)

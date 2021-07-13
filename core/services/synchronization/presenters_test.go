@@ -36,13 +36,13 @@ func TestSyncJobRunPresenter_HappyPath(t *testing.T) {
 	}
 	run := models.MakeJobRun(&job, time.Now(), &models.Initiator{Type: models.InitiatorRunLog}, big.NewInt(0), &runRequest)
 	run.TaskRuns = []models.TaskRun{
-		models.TaskRun{
+		{
 			ID:                               task0RunID,
 			Status:                           models.RunStatusPendingIncomingConfirmations,
 			ObservedIncomingConfirmations:    clnull.Uint32From(1),
 			MinRequiredIncomingConfirmations: clnull.Uint32From(3),
 		},
-		models.TaskRun{
+		{
 			ID:                               task1RunID,
 			Status:                           models.RunStatusErrored,
 			Result:                           models.RunResult{ErrorMessage: null.StringFrom("yikes fam")},
@@ -159,9 +159,9 @@ func TestSyncJobRunPresenter_EthTxTask(t *testing.T) {
 		path string
 		want string
 	}{
-		{"confirmed", "testdata/confirmedEthTxData.json", ""},
-		{"safe fulfilled", "testdata/fulfilledReceiptResponse.json", "fulfilledRunLog"},
-		{"safe not fulfilled", "testdata/notFulfilledReceiptResponse.json", "noFulfilledRunLog"},
+		{"confirmed", "../../testdata/apiresponses/confirmedEthTxData.json", ""},
+		{"safe fulfilled", "../../testdata/apiresponses/fulfilledReceiptResponse.json", "fulfilledRunLog"},
+		{"safe not fulfilled", "../../testdata/apiresponses/notFulfilledReceiptResponse.json", "noFulfilledRunLog"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -183,7 +183,7 @@ func TestSyncJobRunPresenter_EthTxTask(t *testing.T) {
 			run := models.MakeJobRun(&job, time.Now(), &models.Initiator{Type: models.InitiatorRunLog}, big.NewInt(0), &runRequest)
 			run.SetStatus(models.RunStatusCompleted)
 			run.TaskRuns = []models.TaskRun{
-				models.TaskRun{
+				{
 					ID:       uuid.NewV4(),
 					TaskSpec: taskSpec,
 					Status:   models.RunStatusPendingIncomingConfirmations,

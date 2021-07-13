@@ -19,7 +19,7 @@ services:
       - ETH_URL
       - MIN_OUTGOING_CONFIRMATIONS
       - MIN_INCOMING_CONFIRMATIONS
-      - MINIMUM_CONTRACT_PAYMENT
+      - MINIMUM_CONTRACT_PAYMENT_LINK_JUELS
       - DEFAULT_HTTP_TIMEOUT
       - CHAINLINK_DEV
       - EXPLORER_URL
@@ -36,6 +36,8 @@ services:
       - node_password
       - apicredentials
       - keystore
+    depends_on:
+      - explorer
 
   node-2:
     container_name: chainlink-node-2
@@ -52,7 +54,7 @@ services:
       - ETH_URL
       - MIN_OUTGOING_CONFIRMATIONS
       - MIN_INCOMING_CONFIRMATIONS
-      - MINIMUM_CONTRACT_PAYMENT
+      - MINIMUM_CONTRACT_PAYMENT_LINK_JUELS
       - DEFAULT_HTTP_TIMEOUT
       - CHAINLINK_DEV
       - SECURE_COOKIES

@@ -2,7 +2,6 @@ package job_test
 
 import (
 	"context"
-	"net/url"
 	"testing"
 
 	"github.com/smartcontractkit/chainlink/core/logger"
@@ -10,8 +9,8 @@ import (
 	"github.com/smartcontractkit/chainlink/core/services/job"
 	"github.com/smartcontractkit/chainlink/core/services/pipeline"
 
-	"github.com/shopspring/decimal"
 	"github.com/smartcontractkit/chainlink/core/internal/cltest"
+	"github.com/smartcontractkit/chainlink/core/internal/cltest/heavyweight"
 	"github.com/smartcontractkit/chainlink/core/services/postgres"
 	"github.com/smartcontractkit/chainlink/core/store/models"
 	"github.com/stretchr/testify/require"
@@ -19,12 +18,31 @@ import (
 )
 
 func clearJobsDb(t *testing.T, db *gorm.DB) {
+	t.Helper()
 	err := db.Exec(`TRUNCATE jobs, pipeline_runs, pipeline_specs, pipeline_task_runs CASCADE`).Error
 	require.NoError(t, err)
 }
 
 func TestPipelineORM_Integration(t *testing.T) {
-	config, oldORM, cleanupDB := cltest.BootstrapThrowawayORM(t, "pipeline_orm", true, true)
+	const DotStr = `
+        // data source 1
+        ds1          [type=bridge name=voter_turnout];
+        ds1_parse    [type=jsonparse path="one,two"];
+        ds1_multiply [type=multiply times=1.23];
+
+        // data source 2
+        ds2          [type=http method=GET url="https://chain.link/voter_turnout/USA-2020" requestData=<{"hi": "hello"}>];
+        ds2_parse    [type=jsonparse path="three,four"];
+        ds2_multiply [type=multiply times=4.56];
+
+        ds1 -> ds1_parse -> ds1_multiply -> answer1;
+        ds2 -> ds2_parse -> ds2_multiply -> answer1;
+
+        answer1 [type=median                      index=0];
+        answer2 [type=bridge name=election_winner index=1];
+    `
+
+	config, oldORM, cleanupDB := heavyweight.FullTestORM(t, "pipeline_orm", true, true)
 	config.Set("DEFAULT_HTTP_TIMEOUT", "30ms")
 	config.Set("MAX_HTTP_ATTEMPTS", "1")
 	defer cleanupDB()
@@ -35,43 +53,42 @@ func TestPipelineORM_Integration(t *testing.T) {
 
 	var specID int32
 
-	u, err := url.Parse("https://chain.link/voter_turnout/USA-2020")
-	require.NoError(t, err)
-
 	answer1 := &pipeline.MedianTask{
-		BaseTask: pipeline.NewBaseTask("answer1", nil, 0, 0),
+		AllowedFaults: "",
 	}
 	answer2 := &pipeline.BridgeTask{
-		Name:     "election_winner",
-		BaseTask: pipeline.NewBaseTask("answer2", nil, 1, 0),
+		Name: "election_winner",
 	}
 	ds1_multiply := &pipeline.MultiplyTask{
-		Times:    decimal.NewFromFloat(1.23),
-		BaseTask: pipeline.NewBaseTask("ds1_multiply", answer1, 0, 0),
+		Times: "1.23",
 	}
 	ds1_parse := &pipeline.JSONParseTask{
-		Path:     []string{"one", "two"},
-		BaseTask: pipeline.NewBaseTask("ds1_parse", ds1_multiply, 0, 0),
+		Path: "one,two",
 	}
 	ds1 := &pipeline.BridgeTask{
-		Name:     "voter_turnout",
-		BaseTask: pipeline.NewBaseTask("ds1", ds1_parse, 0, 0),
+		Name: "voter_turnout",
 	}
 	ds2_multiply := &pipeline.MultiplyTask{
-		Times:    decimal.NewFromFloat(4.56),
-		BaseTask: pipeline.NewBaseTask("ds2_multiply", answer1, 0, 0),
+		Times: "4.56",
 	}
 	ds2_parse := &pipeline.JSONParseTask{
-		Path:     []string{"three", "four"},
-		BaseTask: pipeline.NewBaseTask("ds2_parse", ds2_multiply, 0, 0),
+		Path: "three,four",
 	}
 	ds2 := &pipeline.HTTPTask{
-		URL:         models.WebURL(*u),
+		URL:         "https://chain.link/voter_turnout/USA-2020",
 		Method:      "GET",
-		RequestData: pipeline.HttpRequestData{"hi": "hello"},
-		BaseTask:    pipeline.NewBaseTask("ds2", ds2_parse, 0, 0),
+		RequestData: `{"hi": "hello"}`,
 	}
-	expectedTasks := []pipeline.Task{answer1, answer2, ds1_multiply, ds1_parse, ds1, ds2_multiply, ds2_parse, ds2}
+
+	answer1.BaseTask = pipeline.NewBaseTask(6, "answer1", []pipeline.Task{ds1_multiply, ds2_multiply}, nil, 0)
+	answer2.BaseTask = pipeline.NewBaseTask(7, "answer2", nil, nil, 1)
+	ds1_multiply.BaseTask = pipeline.NewBaseTask(2, "ds1_multiply", []pipeline.Task{ds1_parse}, []pipeline.Task{answer1}, 0)
+	ds2_multiply.BaseTask = pipeline.NewBaseTask(5, "ds2_multiply", []pipeline.Task{ds2_parse}, []pipeline.Task{answer1}, 0)
+	ds1_parse.BaseTask = pipeline.NewBaseTask(1, "ds1_parse", []pipeline.Task{ds1}, []pipeline.Task{ds1_multiply}, 0)
+	ds2_parse.BaseTask = pipeline.NewBaseTask(4, "ds2_parse", []pipeline.Task{ds2}, []pipeline.Task{ds2_multiply}, 0)
+	ds1.BaseTask = pipeline.NewBaseTask(0, "ds1", nil, []pipeline.Task{ds1_parse}, 0)
+	ds2.BaseTask = pipeline.NewBaseTask(3, "ds2", nil, []pipeline.Task{ds2_parse}, 0)
+	expectedTasks := []pipeline.Task{ds1, ds1_parse, ds1_multiply, ds2, ds2_parse, ds2_multiply, answer1, answer2}
 	_, bridge := cltest.NewBridgeType(t, "voter_turnout", "http://blah.com")
 	require.NoError(t, db.Create(bridge).Error)
 	_, bridge2 := cltest.NewBridgeType(t, "election_winner", "http://blah.com")
@@ -82,11 +99,10 @@ func TestPipelineORM_Integration(t *testing.T) {
 		orm, _, cleanup := cltest.NewPipelineORM(t, config, db)
 		defer cleanup()
 
-		g := pipeline.NewTaskDAG()
-		err := g.UnmarshalText([]byte(pipeline.DotStr))
+		p, err := pipeline.Parse(DotStr)
 		require.NoError(t, err)
 
-		specID, err = orm.CreateSpec(context.Background(), db, *g, models.Interval(0))
+		specID, err = orm.CreateSpec(context.Background(), db, *p, models.Interval(0))
 		require.NoError(t, err)
 
 		var specs []pipeline.Spec
@@ -94,7 +110,7 @@ func TestPipelineORM_Integration(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, specs, 1)
 		require.Equal(t, specID, specs[0].ID)
-		require.Equal(t, pipeline.DotStr, specs[0].DotDagSource)
+		require.Equal(t, DotStr, specs[0].DotDagSource)
 
 		require.NoError(t, db.Exec(`DELETE FROM pipeline_specs`).Error)
 	})
@@ -103,7 +119,7 @@ func TestPipelineORM_Integration(t *testing.T) {
 		clearJobsDb(t, db)
 		orm, eventBroadcaster, cleanup := cltest.NewPipelineORM(t, config, db)
 		defer cleanup()
-		runner := pipeline.NewRunner(orm, config)
+		runner := pipeline.NewRunner(orm, config, nil, nil)
 		defer runner.Close()
 		jobORM := job.NewORM(db, config.Config, orm, eventBroadcaster, &postgres.NullAdvisoryLocker{})
 		defer jobORM.Close()
@@ -122,7 +138,7 @@ func TestPipelineORM_Integration(t *testing.T) {
 		pipelineSpecID := pipelineSpecs[0].ID
 
 		// Create the run
-		runID, _, err := runner.ExecuteAndInsertNewRun(context.Background(), pipelineSpecs[0], pipeline.JSONSerializable{}, *logger.Default, true)
+		runID, _, err := runner.ExecuteAndInsertFinishedRun(context.Background(), pipelineSpecs[0], pipeline.NewVarsFrom(nil), *logger.Default, true)
 		require.NoError(t, err)
 
 		// Check the DB for the pipeline.Run

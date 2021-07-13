@@ -2,11 +2,17 @@ package offchainreporting
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
-	"math/big"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/smartcontractkit/chainlink/core/chains"
+	"github.com/smartcontractkit/chainlink/core/services/postgres"
+
+	"gorm.io/gorm"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -14,10 +20,10 @@ import (
 	gethCommon "github.com/ethereum/go-ethereum/common"
 	gethTypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/pkg/errors"
-	"github.com/smartcontractkit/chainlink/core/internal/gethwrappers/generated"
 	"github.com/smartcontractkit/chainlink/core/internal/gethwrappers/generated/offchain_aggregator_wrapper"
 	"github.com/smartcontractkit/chainlink/core/logger"
 	"github.com/smartcontractkit/chainlink/core/services/eth"
+	httypes "github.com/smartcontractkit/chainlink/core/services/headtracker/types"
 	"github.com/smartcontractkit/chainlink/core/services/log"
 	"github.com/smartcontractkit/chainlink/core/store/models"
 	"github.com/smartcontractkit/chainlink/core/utils"
@@ -35,6 +41,7 @@ const configMailboxSanityLimit = 100
 var (
 	_ ocrtypes.ContractConfigTracker = &OCRContractTracker{}
 	_ log.Listener                   = &OCRContractTracker{}
+	_ httypes.HeadTrackable          = &OCRContractTracker{}
 
 	OCRContractConfigSet            = getEventTopic("ConfigSet")
 	OCRContractLatestRoundRequested = getEventTopic("RoundRequested")
@@ -55,6 +62,13 @@ type (
 		jobID            int32
 		logger           logger.Logger
 		db               OCRContractTrackerDB
+		gdb              *gorm.DB
+		blockTranslator  BlockTranslator
+		chain            *chains.Chain
+
+		// HeadBroadcaster
+		headBroadcaster  httypes.HeadBroadcaster
+		unsubscribeHeads func()
 
 		// Start/Stop lifecycle
 		ctx             context.Context
@@ -69,10 +83,13 @@ type (
 		// ContractConfig
 		configsMB utils.Mailbox
 		chConfigs chan ocrtypes.ContractConfig
+
+		// LatestBlockHeight
+		latestBlockHeight int64
 	}
 
 	OCRContractTrackerDB interface {
-		SaveLatestRoundRequested(rr offchainaggregator.OffchainAggregatorRoundRequested) error
+		SaveLatestRoundRequested(tx *sql.Tx, rr offchainaggregator.OffchainAggregatorRoundRequested) error
 		LoadLatestRoundRequested() (rr offchainaggregator.OffchainAggregatorRoundRequested, err error)
 	}
 )
@@ -86,8 +103,11 @@ func NewOCRContractTracker(
 	logBroadcaster log.Broadcaster,
 	jobID int32,
 	logger logger.Logger,
+	gdb *gorm.DB,
 	db OCRContractTrackerDB,
-) (o *OCRContractTracker, err error) {
+	chain *chains.Chain,
+	headBroadcaster httypes.HeadBroadcaster,
+) (o *OCRContractTracker) {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &OCRContractTracker{
 		utils.StartStopOnce{},
@@ -99,6 +119,11 @@ func NewOCRContractTracker(
 		jobID,
 		logger,
 		db,
+		gdb,
+		NewBlockTranslator(chain, ethClient),
+		chain,
+		headBroadcaster,
+		nil,
 		ctx,
 		cancel,
 		sync.WaitGroup{},
@@ -107,47 +132,59 @@ func NewOCRContractTracker(
 		sync.RWMutex{},
 		*utils.NewMailbox(configMailboxSanityLimit),
 		make(chan ocrtypes.ContractConfig),
-	}, nil
+		-1,
+	}
 }
 
 // Start must be called before logs can be delivered
 // It ought to be called before starting OCR
-func (t *OCRContractTracker) Start() (err error) {
-	if !t.OkayToStart() {
-		return errors.New("OCRContractTracker: already started")
-	}
-	connected, unsubscribe := t.logBroadcaster.Register(t, log.ListenerOpts{
-		Contract: t.contract,
-		Logs: []generated.AbigenLog{
-			offchain_aggregator_wrapper.OffchainAggregatorRoundRequested{},
-			offchain_aggregator_wrapper.OffchainAggregatorConfigSet{},
-		},
-	})
-	t.unsubscribeLogs = unsubscribe
+func (t *OCRContractTracker) Start() error {
+	return t.StartOnce("OCRContractTracker", func() (err error) {
+		t.latestRoundRequested, err = t.db.LoadLatestRoundRequested()
+		if err != nil {
+			return errors.Wrap(err, "OCRContractTracker#Start: failed to load latest round requested")
+		}
 
-	if !connected {
-		t.logger.Warnw("OCRContractTracker#Start: log broadcaster is not connected", "jobID", t.jobID, "address", t.contract.Address())
-	}
-	t.latestRoundRequested, err = t.db.LoadLatestRoundRequested()
-	if err != nil {
-		unsubscribe()
-		return errors.Wrap(err, "OCRContractTracker#Start: failed to load latest round requested")
-	}
-	t.wg.Add(1)
-	go t.processLogs()
-	return nil
+		t.unsubscribeLogs = t.logBroadcaster.Register(t, log.ListenerOpts{
+			Contract: t.contract.Address(),
+			ParseLog: t.contract.ParseLog,
+			LogsWithTopics: map[gethCommon.Hash][][]log.Topic{
+				offchain_aggregator_wrapper.OffchainAggregatorRoundRequested{}.Topic(): nil,
+				offchain_aggregator_wrapper.OffchainAggregatorConfigSet{}.Topic():      nil,
+			},
+			NumConfirmations: 1,
+		})
+
+		t.unsubscribeHeads = t.headBroadcaster.Subscribe(t)
+
+		t.wg.Add(1)
+		go t.processLogs()
+		return nil
+	})
 }
 
 // Close should be called after teardown of the OCR job relying on this tracker
 func (t *OCRContractTracker) Close() error {
-	if !t.OkayToStop() {
-		return errors.New("OCRContractTracker already stopped")
+	return t.StopOnce("OCRContractTracker", func() error {
+		t.ctxCancel()
+		t.wg.Wait()
+		t.unsubscribeHeads()
+		t.unsubscribeLogs()
+		close(t.chConfigs)
+		return nil
+	})
+}
+
+// Connect conforms to HeadTrackable
+func (t *OCRContractTracker) Connect(*models.Head) error { return nil }
+
+// OnNewLongestChain conformed to HeadTrackable and updates latestBlockHeight
+func (t *OCRContractTracker) OnNewLongestChain(ctx context.Context, h models.Head) {
+	if h.L1BlockNumber.Valid {
+		atomic.StoreInt64(&t.latestBlockHeight, h.L1BlockNumber.Int64)
+	} else {
+		atomic.StoreInt64(&t.latestBlockHeight, h.Number)
 	}
-	t.ctxCancel()
-	t.wg.Wait()
-	t.unsubscribeLogs()
-	close(t.chConfigs)
-	return nil
 }
 
 func (t *OCRContractTracker) processLogs() {
@@ -159,8 +196,8 @@ func (t *OCRContractTracker) processLogs() {
 			// new config. To avoid blocking the log broadcaster, we use this
 			// background thread to deliver them and a mailbox as the buffer.
 			for {
-				x := t.configsMB.Retrieve()
-				if x == nil {
+				x, exists := t.configsMB.Retrieve()
+				if !exists {
 					break
 				}
 				cc, ok := x.(ocrtypes.ContractConfig)
@@ -188,7 +225,7 @@ func (t *OCRContractTracker) OnDisconnect() {}
 // HandleLog complies with LogListener interface
 // It is not thread safe
 func (t *OCRContractTracker) HandleLog(lb log.Broadcast) {
-	was, err := lb.WasAlreadyConsumed()
+	was, err := t.logBroadcaster.WasAlreadyConsumed(t.gdb, lb)
 	if err != nil {
 		t.logger.Errorw("OCRContract: could not determine if log was already consumed", "error", err)
 		return
@@ -199,41 +236,52 @@ func (t *OCRContractTracker) HandleLog(lb log.Broadcast) {
 	raw := lb.RawLog()
 	if raw.Address != t.contract.Address() {
 		t.logger.Errorf("log address of 0x%x does not match configured contract address of 0x%x", raw.Address, t.contract.Address())
-		t.logger.ErrorIfCalling(lb.MarkConsumed)
+		t.logger.ErrorIfCalling(func() error { return t.logBroadcaster.MarkConsumed(t.gdb, lb) })
 		return
 	}
 	topics := raw.Topics
 	if len(topics) == 0 {
-		t.logger.ErrorIfCalling(lb.MarkConsumed)
+		t.logger.ErrorIfCalling(func() error { return t.logBroadcaster.MarkConsumed(t.gdb, lb) })
 		return
 	}
 
+	var consumed bool
 	switch topics[0] {
 	case OCRContractConfigSet:
 		var configSet *offchainaggregator.OffchainAggregatorConfigSet
 		configSet, err = t.contractFilterer.ParseConfigSet(raw)
 		if err != nil {
 			t.logger.Errorw("could not parse config set", "err", err)
-			logger.ErrorIfCalling(lb.MarkConsumed)
+			t.logger.ErrorIfCalling(func() error { return t.logBroadcaster.MarkConsumed(t.gdb, lb) })
 			return
 		}
 		configSet.Raw = lb.RawLog()
 		cc := confighelper.ContractConfigFromConfigSetEvent(*configSet)
 
-		t.configsMB.Deliver(cc)
+		wasOverCapacity := t.configsMB.Deliver(cc)
+		if wasOverCapacity {
+			t.logger.Error("config mailbox is over capacity - dropped the oldest unprocessed item")
+		}
 	case OCRContractLatestRoundRequested:
 		var rr *offchainaggregator.OffchainAggregatorRoundRequested
 		rr, err = t.contractFilterer.ParseRoundRequested(raw)
 		if err != nil {
 			t.logger.Errorw("could not parse round requested", "err", err)
-			t.logger.ErrorIfCalling(lb.MarkConsumed)
+			t.logger.ErrorIfCalling(func() error { return t.logBroadcaster.MarkConsumed(t.gdb, lb) })
 			return
 		}
 		if IsLaterThan(raw, t.latestRoundRequested.Raw) {
-			if err := t.db.SaveLatestRoundRequested(*rr); err != nil {
-				t.logger.Error(err)
+			err = postgres.GormTransactionWithDefaultContext(t.gdb, func(tx *gorm.DB) error {
+				if err = t.db.SaveLatestRoundRequested(postgres.MustSQLTx(tx), *rr); err != nil {
+					return err
+				}
+				return t.logBroadcaster.MarkConsumed(tx, lb)
+			})
+			if err != nil {
+				logger.Error(err)
 				return
 			}
+			consumed = true
 			t.lrrMu.Lock()
 			t.latestRoundRequested = *rr
 			t.lrrMu.Unlock()
@@ -244,8 +292,9 @@ func (t *OCRContractTracker) HandleLog(lb log.Broadcast) {
 	default:
 		logger.Debugw("OCRContractTracker: got unrecognised log topic", "topic", topics[0])
 	}
-
-	logger.ErrorIfCalling(lb.MarkConsumed)
+	if !consumed {
+		t.logger.ErrorIfCalling(func() error { return t.logBroadcaster.MarkConsumed(t.gdb, lb) })
+	}
 }
 
 // IsLaterThan returns true if the first log was emitted "after" the second log
@@ -296,9 +345,10 @@ func (t *OCRContractTracker) LatestConfigDetails(ctx context.Context) (changedIn
 
 // ConfigFromLogs queries the eth node for logs for this contract
 func (t *OCRContractTracker) ConfigFromLogs(ctx context.Context, changedInBlock uint64) (c ocrtypes.ContractConfig, err error) {
+	fromBlock, toBlock := t.blockTranslator.NumberToQueryRange(ctx, changedInBlock)
 	q := ethereum.FilterQuery{
-		FromBlock: big.NewInt(int64(changedInBlock)),
-		ToBlock:   big.NewInt(int64(changedInBlock)),
+		FromBlock: fromBlock,
+		ToBlock:   toBlock,
 		Addresses: []gethCommon.Address{t.contract.Address()},
 		Topics: [][]gethCommon.Hash{
 			{OCRContractConfigSet},
@@ -329,19 +379,34 @@ func (t *OCRContractTracker) ConfigFromLogs(ctx context.Context, changedInBlock 
 }
 
 // LatestBlockHeight queries the eth node for the most recent header
-// TODO(sam): This could (should?) be optimised to use the head tracker
-// https://www.pivotaltracker.com/story/show/177006717
 func (t *OCRContractTracker) LatestBlockHeight(ctx context.Context) (blockheight uint64, err error) {
+	// We skip confirmation checking anyway on Optimism so there's no need to
+	// care about the block height; we have no way of getting the L1 block
+	// height anyway
+	if t.chain.IsOptimism() {
+		return 0, nil
+	}
+	latestBlockHeight := atomic.LoadInt64(&t.latestBlockHeight)
+	if latestBlockHeight >= 0 {
+		return uint64(latestBlockHeight), nil
+	}
+
+	t.logger.Debugw("OCRContractTracker: still waiting for first head, falling back to on-chain lookup")
+
 	var cancel context.CancelFunc
 	ctx, cancel = utils.CombinedContext(t.ctx, ctx)
 	defer cancel()
 
-	h, err := t.ethClient.HeaderByNumber(ctx, nil)
+	h, err := t.ethClient.HeadByNumber(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	if h == nil {
 		return 0, errors.New("got nil head")
+	}
+
+	if h.L1BlockNumber.Valid {
+		return uint64(h.L1BlockNumber.Int64), nil
 	}
 
 	return uint64(h.Number), nil

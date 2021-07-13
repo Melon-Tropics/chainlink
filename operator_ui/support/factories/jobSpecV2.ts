@@ -5,6 +5,9 @@ import {
   FluxMonitorJobV2Spec,
   KeeperV2Spec,
   OffChainReportingOracleJobV2Spec,
+  CronV2Spec,
+  WebhookV2Spec,
+  VRFV2Spec,
 } from 'core/store/models'
 import { generateUuid } from '../test-helpers/generateUuid'
 
@@ -42,10 +45,14 @@ export function ocrJobSpecV2(
     name: config.name || 'V2 job',
     type: 'offchainreporting',
     schemaVersion: 1,
+    externalJobID: '0EEC7E1D-D0D2-476C-A1A8-72DFB6633F46',
     offChainReportingOracleSpec,
     fluxMonitorSpec: null,
     directRequestSpec: null,
     keeperSpec: null,
+    vrfSpec: null,
+    cronSpec: null,
+    webhookSpec: null,
     errors: [],
     maxTaskDuration: '',
     pipelineSpec: {
@@ -78,9 +85,13 @@ export function fluxMonitorJobV2(
     name: config.name || 'Flux Monitor V2 job',
     type: 'fluxmonitor',
     schemaVersion: 1,
+    externalJobID: '0EEC7E1D-D0D2-476C-A1A8-72DFB6633F47',
     directRequestSpec: null,
     offChainReportingOracleSpec: null,
     keeperSpec: null,
+    cronSpec: null,
+    webhookSpec: null,
+    vrfSpec: null,
     fluxMonitorSpec,
     errors: [],
     maxTaskDuration: '',
@@ -114,10 +125,14 @@ export function directRequestJobV2(
     name: config.name || 'Direct Request V2 job',
     type: 'directrequest',
     schemaVersion: 1,
+    externalJobID: '0EEC7E1D-D0D2-476C-A1A8-72DFB6633F49',
     directRequestSpec,
     offChainReportingOracleSpec: null,
     keeperSpec: null,
+    cronSpec: null,
+    webhookSpec: null,
     fluxMonitorSpec: null,
+    vrfSpec: null,
     errors: [],
     maxTaskDuration: '',
     pipelineSpec: {
@@ -144,9 +159,103 @@ export function keeperJobV2(
     type: 'keeper',
     schemaVersion: 1,
     directRequestSpec: null,
+    externalJobID: '0EEC7E1D-D0D2-476C-A1A8-72DFB6633F50',
     keeperSpec,
     offChainReportingOracleSpec: null,
     fluxMonitorSpec: null,
+    vrfSpec: null,
+    cronSpec: null,
+    webhookSpec: null,
+    errors: [],
+    maxTaskDuration: '',
+    pipelineSpec: {
+      dotDagSource: '',
+    },
+  }
+}
+
+export function cronJobV2(
+  spec: Partial<CronV2Spec['cronSpec']> = {},
+  config: Partial<{
+    name?: string
+    id?: string
+  }> = {},
+): JobSpecV2 {
+  const cronSpec = partialAsFull<CronV2Spec['cronSpec']>({
+    createdAt: spec.createdAt || new Date(1600775300410).toISOString(),
+  })
+  return {
+    name: config.name || 'Cron V2 job',
+    type: 'cron',
+    externalJobID: '0EEC7E1D-D0D2-476C-A1A8-72DFB6633F51',
+    schemaVersion: 1,
+    directRequestSpec: null,
+    keeperSpec: null,
+    vrfSpec: null,
+    offChainReportingOracleSpec: null,
+    fluxMonitorSpec: null,
+    cronSpec,
+    webhookSpec: null,
+    errors: [],
+    maxTaskDuration: '',
+    pipelineSpec: {
+      dotDagSource: '',
+    },
+  }
+}
+
+export function webhookJobV2(
+  spec: Partial<WebhookV2Spec['webhookSpec']> = {},
+  config: Partial<{
+    name?: string
+    id?: string
+  }> = {},
+): JobSpecV2 {
+  const webhookSpec = partialAsFull<WebhookV2Spec['webhookSpec']>({
+    createdAt: spec.createdAt || new Date(1600775300410).toISOString(),
+  })
+  return {
+    name: config.name || 'Web V2 job',
+    type: 'webhook',
+    externalJobID: '0EEC7E1D-D0D2-476C-A1A8-72DFB6633F52',
+    schemaVersion: 1,
+    directRequestSpec: null,
+    vrfSpec: null,
+    keeperSpec: null,
+    offChainReportingOracleSpec: null,
+    fluxMonitorSpec: null,
+    cronSpec: null,
+    webhookSpec,
+    errors: [],
+    maxTaskDuration: '',
+    pipelineSpec: {
+      dotDagSource: '',
+    },
+  }
+}
+
+export function vrfJobV2(
+  spec: Partial<VRFV2Spec['vrfSpec']> = {},
+  config: Partial<{
+    name?: string
+    id?: string
+  }> = {},
+): JobSpecV2 {
+  const vrfSpec = partialAsFull<VRFV2Spec['vrfSpec']>({
+    createdAt: spec.createdAt || new Date(1600775300410).toISOString(),
+  })
+  return {
+    name: config.name || 'VRF V2 job',
+    type: 'vrf',
+    externalJobID: '0EEC7E1D-D0D2-476C-A1A8-72DFB6633F52',
+    schemaVersion: 1,
+    directRequestSpec: null,
+    keeperSpec: null,
+    offChainReportingOracleSpec: null,
+    fluxMonitorSpec: null,
+    cronSpec: null,
+    webhookSpec: null,
+    vrfSpec,
     errors: [],
     maxTaskDuration: '',
     pipelineSpec: {

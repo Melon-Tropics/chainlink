@@ -8,11 +8,10 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/smartcontractkit/chainlink/core/services/keystore"
 	"github.com/smartcontractkit/chainlink/core/store"
 	"github.com/smartcontractkit/chainlink/core/store/models"
 	"github.com/smartcontractkit/chainlink/core/utils"
-
-	"github.com/pkg/errors"
 )
 
 // Bridge adapter is responsible for connecting the task pipeline to external
@@ -34,7 +33,7 @@ func (ba *Bridge) TaskType() models.TaskType {
 //
 // If the Perform is resumed with a pending RunResult, the RunResult is marked
 // not pending and the RunResult is returned.
-func (ba *Bridge) Perform(input models.RunInput, store *store.Store) models.RunOutput {
+func (ba *Bridge) Perform(input models.RunInput, store *store.Store, _ *keystore.Master) models.RunOutput {
 	if input.Status().Completed() {
 		return models.NewRunOutputComplete(input.Data())
 	} else if input.Status().PendingBridge() {
@@ -44,10 +43,11 @@ func (ba *Bridge) Perform(input models.RunInput, store *store.Store) models.RunO
 }
 
 func (ba *Bridge) handleNewRun(input models.RunInput, store *store.Store) models.RunOutput {
-	data, err := models.Merge(input.Data(), ba.Params)
+	data, err := models.MergeExceptResult(input.Data(), ba.Params)
 	if err != nil {
 		return models.NewRunOutputError(baRunResultError("handling data param", err))
 	}
+	input = input.CloneWithData(data)
 
 	responseURL := store.Config.BridgeResponseURL()
 	if *responseURL != *zeroURL {
@@ -64,7 +64,6 @@ func (ba *Bridge) handleNewRun(input models.RunInput, store *store.Store) models
 		return models.NewRunOutputError(baRunResultError("post to external adapter", err))
 	}
 
-	input = input.CloneWithData(data)
 	return ba.responseToRunResult(body, input)
 }
 
@@ -100,12 +99,7 @@ func (ba *Bridge) postToExternalAdapter(
 	bridgeResponseURL *url.URL,
 	config utils.HTTPRequestConfig,
 ) ([]byte, error) {
-	data, err := models.Merge(input.Data(), ba.Params)
-	if err != nil {
-		return nil, errors.Wrap(err, "error merging bridge params with input params")
-	}
-
-	outgoing := bridgeOutgoing{JobRunID: input.JobRunID().String(), Data: data}
+	outgoing := bridgeOutgoing{JobRunID: input.JobRunID().String(), Data: input.Data()}
 	if bridgeResponseURL != nil {
 		outgoing.ResponseURL = bridgeResponseURL.String()
 	}
@@ -126,7 +120,7 @@ func (ba *Bridge) postToExternalAdapter(
 		Config:  config,
 	}
 
-	bytes, statusCode, err := httpRequest.SendRequest(context.TODO())
+	bytes, statusCode, _, err := httpRequest.SendRequest(context.TODO())
 
 	if err != nil {
 		return nil, err

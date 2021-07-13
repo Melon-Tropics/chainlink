@@ -1,34 +1,52 @@
 package keeper
 
 import (
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/pkg/errors"
 	"github.com/smartcontractkit/chainlink/core/internal/gethwrappers/generated/keeper_registry_wrapper"
-	"github.com/smartcontractkit/chainlink/core/services"
+	"github.com/smartcontractkit/chainlink/core/services/bulletprooftxmanager"
 	"github.com/smartcontractkit/chainlink/core/services/eth"
+	httypes "github.com/smartcontractkit/chainlink/core/services/headtracker/types"
 	"github.com/smartcontractkit/chainlink/core/services/job"
 	"github.com/smartcontractkit/chainlink/core/services/log"
+	"github.com/smartcontractkit/chainlink/core/services/pipeline"
 	"github.com/smartcontractkit/chainlink/core/store/orm"
 	"gorm.io/gorm"
 )
 
+type transmitter interface {
+	CreateEthTransaction(db *gorm.DB, fromAddress, toAddress common.Address, payload []byte, gasLimit uint64, meta interface{}, strategy bulletprooftxmanager.TxStrategy) (etx bulletprooftxmanager.EthTx, err error)
+}
+
 type Delegate struct {
-	config          *orm.Config
+	config          orm.ConfigReader
 	db              *gorm.DB
+	txm             transmitter
+	jrm             job.ORM
+	pr              pipeline.Runner
 	ethClient       eth.Client
-	headBroadcaster *services.HeadBroadcaster
+	headBroadcaster httypes.HeadBroadcaster
 	logBroadcaster  log.Broadcaster
 }
 
+var _ job.Delegate = (*Delegate)(nil)
+
 func NewDelegate(
 	db *gorm.DB,
+	txm transmitter,
+	jrm job.ORM,
+	pr pipeline.Runner,
 	ethClient eth.Client,
-	headBroadcaster *services.HeadBroadcaster,
+	headBroadcaster httypes.HeadBroadcaster,
 	logBroadcaster log.Broadcaster,
 	config *orm.Config,
 ) *Delegate {
 	return &Delegate{
 		config:          config,
 		db:              db,
+		txm:             txm,
+		jrm:             jrm,
+		pr:              pr,
 		ethClient:       ethClient,
 		headBroadcaster: headBroadcaster,
 		logBroadcaster:  logBroadcaster,
@@ -38,6 +56,9 @@ func NewDelegate(
 func (d *Delegate) JobType() job.Type {
 	return job.Keeper
 }
+
+func (Delegate) OnJobCreated(spec job.Job) {}
+func (Delegate) OnJobDeleted(spec job.Job) {}
 
 func (d *Delegate) ServicesForSpec(spec job.Job) (services []job.Service, err error) {
 	if spec.KeeperSpec == nil {
@@ -52,26 +73,30 @@ func (d *Delegate) ServicesForSpec(spec job.Job) (services []job.Service, err er
 	if err != nil {
 		return nil, errors.Wrap(err, "unable to create keeper registry contract wrapper")
 	}
+	strategy := bulletprooftxmanager.NewQueueingTxStrategy(spec.ExternalJobID, d.config.KeeperDefaultTransactionQueueDepth())
+
+	orm := NewORM(d.db, d.txm, d.config, strategy)
 
 	registrySynchronizer := NewRegistrySynchronizer(
 		spec,
 		contract,
-		d.db,
-		d.headBroadcaster,
+		orm,
+		d.jrm,
 		d.logBroadcaster,
 		d.config.KeeperRegistrySyncInterval(),
 		d.config.KeeperMinimumRequiredConfirmations(),
 	)
-	upkeepExecutor := NewUpkeepExecutor(
+	upkeepExecuter := NewUpkeepExecuter(
 		spec,
-		d.db,
+		orm,
+		d.pr,
 		d.ethClient,
 		d.headBroadcaster,
-		d.config.KeeperMaximumGracePeriod(),
+		d.config,
 	)
 
 	return []job.Service{
 		registrySynchronizer,
-		upkeepExecutor,
+		upkeepExecuter,
 	}, nil
 }

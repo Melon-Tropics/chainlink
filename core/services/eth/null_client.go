@@ -16,6 +16,10 @@ import (
 // NullClient satisfies the Client but has no side effects
 type NullClient struct{}
 
+// NullClientChainID the ChainID that nullclient will return
+// 0 is never used as a real chain ID so makes sense as a dummy value here
+const NullClientChainID = 0
+
 //
 // Client methods
 //
@@ -44,11 +48,6 @@ func (nc *NullClient) GetEthBalance(context.Context, common.Address, *big.Int) (
 	return assets.NewEth(0), nil
 }
 
-func (nc *NullClient) SendRawTx(bytes []byte) (common.Hash, error) {
-	logger.Debug("NullClient#SendRawTx")
-	return common.Hash{}, nil
-}
-
 func (nc *NullClient) Call(result interface{}, method string, args ...interface{}) error {
 	logger.Debug("NullClient#Call")
 	return nil
@@ -59,8 +58,8 @@ func (nc *NullClient) CallContext(ctx context.Context, result interface{}, metho
 	return nil
 }
 
-func (nc *NullClient) HeaderByNumber(ctx context.Context, n *big.Int) (*models.Head, error) {
-	logger.Debug("NullClient#HeaderByNumber")
+func (nc *NullClient) HeadByNumber(ctx context.Context, n *big.Int) (*models.Head, error) {
+	logger.Debug("NullClient#HeadByNumber")
 	return &models.Head{}, nil
 }
 
@@ -91,7 +90,12 @@ func (nc *NullClient) SubscribeNewHead(ctx context.Context, ch chan<- *models.He
 
 func (nc *NullClient) ChainID(ctx context.Context) (*big.Int, error) {
 	logger.Debug("NullClient#ChainID")
-	return big.NewInt(1), nil
+	return big.NewInt(NullClientChainID), nil
+}
+
+func (nc *NullClient) HeaderByNumber(ctx context.Context, n *big.Int) (*types.Header, error) {
+	logger.Debug("NullClient#HeaderByNumber")
+	return nil, nil
 }
 
 func (nc *NullClient) SendTransaction(ctx context.Context, tx *types.Transaction) error {
@@ -106,6 +110,11 @@ func (nc *NullClient) PendingCodeAt(ctx context.Context, account common.Address)
 
 func (nc *NullClient) PendingNonceAt(ctx context.Context, account common.Address) (uint64, error) {
 	logger.Debug("NullClient#PendingNonceAt")
+	return 0, nil
+}
+
+func (nc *NullClient) NonceAt(ctx context.Context, account common.Address, blockNumber *big.Int) (uint64, error) {
+	logger.Debug("NullClient#NonceAt")
 	return 0, nil
 }
 
@@ -155,4 +164,8 @@ func (nc *NullClient) BatchCallContext(ctx context.Context, b []rpc.BatchElem) e
 
 func (nc *NullClient) RoundRobinBatchCallContext(ctx context.Context, b []rpc.BatchElem) error {
 	return nil
+}
+
+func (nc *NullClient) SuggestGasTipCap(ctx context.Context) (tipCap *big.Int, err error) {
+	return nil, nil
 }

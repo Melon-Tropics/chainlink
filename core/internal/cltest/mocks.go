@@ -15,6 +15,7 @@ import (
 	"github.com/smartcontractkit/chainlink/core/cmd"
 	"github.com/smartcontractkit/chainlink/core/logger"
 	"github.com/smartcontractkit/chainlink/core/services/chainlink"
+	"github.com/smartcontractkit/chainlink/core/services/keystore"
 	"github.com/smartcontractkit/chainlink/core/store"
 	"github.com/smartcontractkit/chainlink/core/store/models"
 	"github.com/smartcontractkit/chainlink/core/store/orm"
@@ -165,19 +166,23 @@ func (a noopStopApplication) Stop() error {
 
 // CallbackAuthenticator contains a call back authenticator method
 type CallbackAuthenticator struct {
-	Callback func(*store.Store, string) (string, error)
+	Callback func(*keystore.Eth, string) (string, error)
 }
 
 // Authenticate authenticates store and pwd with the callback authenticator
-func (a CallbackAuthenticator) Authenticate(store *store.Store, pwd string) (string, error) {
-	return a.Callback(store, pwd)
+func (a CallbackAuthenticator) AuthenticateEthKey(ethKeyStore *keystore.Eth, pwd string) (string, error) {
+	return a.Callback(ethKeyStore, pwd)
 }
 
-func (a CallbackAuthenticator) AuthenticateVRFKey(*store.Store, string) error {
+func (a CallbackAuthenticator) AuthenticateVRFKey(vrfKeyStore *keystore.VRF, pwd string) error {
 	return nil
 }
 
-func (a CallbackAuthenticator) AuthenticateOCRKey(*store.Store, string) error {
+func (a CallbackAuthenticator) AuthenticateOCRKey(*keystore.OCR, *orm.Config, string) error {
+	return nil
+}
+
+func (a CallbackAuthenticator) AuthenticateCSAKey(*keystore.CSA, string) error {
 	return nil
 }
 
@@ -256,7 +261,7 @@ func NewHTTPMockServer(
 		called = true
 
 		w.WriteHeader(status)
-		io.WriteString(w, response)
+		_, _ = io.WriteString(w, response) // Assignment for errcheck. Only used in tests so we can ignore.
 	})
 
 	server := httptest.NewServer(handler)
@@ -280,7 +285,7 @@ func NewHTTPMockServerWithRequest(
 		called = true
 
 		w.WriteHeader(status)
-		io.WriteString(w, response)
+		_, _ = io.WriteString(w, response) // Assignment for errcheck. Only used in tests so we can ignore.
 	})
 
 	server := httptest.NewServer(handler)
@@ -295,18 +300,17 @@ func NewHTTPMockServerWithAlterableResponse(
 	server = httptest.NewServer(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-			io.WriteString(w, response())
+			_, _ = io.WriteString(w, response())
 		}))
 	return server
 }
 
-func NewHTTPMockServerWithAlterableResponseAndRequest(
-	t *testing.T, response func() string, callback func(r *http.Request)) (server *httptest.Server) {
+func NewHTTPMockServerWithAlterableResponseAndRequest(t *testing.T, response func() string, callback func(r *http.Request)) (server *httptest.Server) {
 	server = httptest.NewServer(
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			callback(r)
 			w.WriteHeader(http.StatusOK)
-			io.WriteString(w, response())
+			_, _ = io.WriteString(w, response())
 		}))
 	return server
 }
@@ -359,7 +363,6 @@ type MockCronEntry struct {
 type MockHeadTrackable struct {
 	connectedCount    int32
 	ConnectedCallback func(bn *models.Head)
-	disconnectedCount int32
 	onNewHeadCount    int32
 }
 
@@ -375,14 +378,6 @@ func (m *MockHeadTrackable) Connect(bn *models.Head) error {
 // ConnectedCount returns the count of connections made, safely.
 func (m *MockHeadTrackable) ConnectedCount() int32 {
 	return atomic.LoadInt32(&m.connectedCount)
-}
-
-// Disconnect increases the disconnected count by one
-func (m *MockHeadTrackable) Disconnect() { atomic.AddInt32(&m.disconnectedCount, 1) }
-
-// DisconnectedCount returns the count of disconnections made, safely.
-func (m *MockHeadTrackable) DisconnectedCount() int32 {
-	return atomic.LoadInt32(&m.disconnectedCount)
 }
 
 // OnNewLongestChain increases the OnNewLongestChainCount count by one
@@ -435,7 +430,7 @@ func (m *MockAPIInitializer) Initialize(store *store.Store) (models.User, error)
 	if user, err := store.FindUser(); err == nil {
 		return user, err
 	}
-	m.Count += 1
+	m.Count++
 	user := MustRandomUser()
 	return user, store.SaveUser(&user)
 }
@@ -463,7 +458,7 @@ type MockSessionRequestBuilder struct {
 }
 
 func (m *MockSessionRequestBuilder) Build(string) (models.SessionRequest, error) {
-	m.Count += 1
+	m.Count++
 	if m.Error != nil {
 		return models.SessionRequest{}, m.Error
 	}

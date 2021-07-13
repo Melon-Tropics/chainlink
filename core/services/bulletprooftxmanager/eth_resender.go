@@ -1,7 +1,6 @@
 package bulletprooftxmanager
 
 import (
-	"context"
 	"fmt"
 	"time"
 
@@ -11,8 +10,9 @@ import (
 	"github.com/lib/pq"
 	"github.com/pkg/errors"
 	"github.com/smartcontractkit/chainlink/core/logger"
+	"github.com/smartcontractkit/chainlink/core/null"
 	"github.com/smartcontractkit/chainlink/core/services/eth"
-	"github.com/smartcontractkit/chainlink/core/store/models"
+	"github.com/smartcontractkit/chainlink/core/static"
 	"github.com/smartcontractkit/chainlink/core/utils"
 	"gorm.io/gorm"
 )
@@ -30,31 +30,31 @@ const defaultResenderPollInterval = 5 * time.Second
 // can occasionally be problems with this (e.g. abnormally long block times, or
 // if gas bumping is disabled)
 type EthResender struct {
-	db           *gorm.DB
-	ethClient    eth.Client
-	interval     time.Duration
-	ageThreshold time.Duration
+	db        *gorm.DB
+	ethClient eth.Client
+	interval  time.Duration
+	config    Config
 
 	chStop chan struct{}
 	chDone chan struct{}
 }
 
-func NewEthResender(db *gorm.DB, ethClient eth.Client, pollInterval, ethTxResendAfterThreshold time.Duration) *EthResender {
-	if ethTxResendAfterThreshold == 0 {
+func NewEthResender(db *gorm.DB, ethClient eth.Client, pollInterval time.Duration, config Config) *EthResender {
+	if config.EthTxResendAfterThreshold() == 0 {
 		panic("EthResender requires a non-zero threshold")
 	}
 	return &EthResender{
 		db,
 		ethClient,
 		pollInterval,
-		ethTxResendAfterThreshold,
+		config,
 		make(chan struct{}),
 		make(chan struct{}),
 	}
 }
 
 func (er *EthResender) Start() {
-	logger.Infof("EthResender: Enabled with poll interval of %s and age threshold of %s", er.interval, er.ageThreshold)
+	logger.Infof("EthResender: Enabled with poll interval of %s and age threshold of %s", er.interval, er.config.EthTxResendAfterThreshold())
 	go er.runLoop()
 }
 
@@ -85,8 +85,11 @@ func (er *EthResender) runLoop() {
 }
 
 func (er *EthResender) resendUnconfirmed() error {
-	olderThan := time.Now().Add(-er.ageThreshold)
-	attempts, err := FindEthTxesRequiringResend(er.db, olderThan)
+	ageThreshold := er.config.EthTxResendAfterThreshold()
+	maxInFlightTransactions := er.config.EthMaxInFlightTransactions()
+
+	olderThan := time.Now().Add(-ageThreshold)
+	attempts, err := FindEthTxesRequiringResend(er.db, olderThan, maxInFlightTransactions)
 	if err != nil {
 		return errors.Wrap(err, "failed to findEthTxAttemptsRequiringReceiptFetch")
 	}
@@ -95,7 +98,7 @@ func (er *EthResender) resendUnconfirmed() error {
 		return nil
 	}
 
-	logger.Debugw(fmt.Sprintf("EthResender: re-sending %d transactions that were last sent over %s ago", len(attempts), er.ageThreshold), "n", len(attempts))
+	logger.Infow(fmt.Sprintf("EthResender: re-sending %d unconfirmed transactions that were last sent over %s ago. These transactions are taking longer than usual to be mined. %s", len(attempts), ageThreshold, static.EthNodeConnectivityProblemLabel), "n", len(attempts))
 
 	reqs := make([]rpc.BatchElem, len(attempts))
 	ethTxIDs := make([]int64, len(attempts))
@@ -110,14 +113,27 @@ func (er *EthResender) resendUnconfirmed() error {
 	}
 
 	now := time.Now()
-	// FIXME: Needs to be split into batches of EthRPCDefaultBatchSize
-	// https://app.clubhouse.io/chainlinklabs/story/7326/ethresender-needs-to-be-batched-to-avoid-saturating-the-websocket
-	if err := er.ethClient.RoundRobinBatchCallContext(context.Background(), reqs); err != nil {
-		return errors.Wrap(err, "failed to re-send transactions")
+	batchSize := int(er.config.EthRPCDefaultBatchSize())
+	if batchSize == 0 {
+		batchSize = len(reqs)
 	}
+	for i := 0; i < len(reqs); i += batchSize {
+		j := i + batchSize
+		if j > len(reqs) {
+			j = len(reqs)
+		}
 
-	if err := er.updateBroadcastAts(now, ethTxIDs); err != nil {
-		return errors.Wrap(err, "failed to update last succeeded on attempts")
+		logger.Debugw(fmt.Sprintf("EthResender: batch resending transactions %v thru %v", i, j))
+
+		ctx, cancel := eth.DefaultQueryCtx()
+		defer cancel()
+		if err := er.ethClient.RoundRobinBatchCallContext(ctx, reqs[i:j]); err != nil {
+			return errors.Wrap(err, "failed to re-send transactions")
+		}
+
+		if err := er.updateBroadcastAts(now, ethTxIDs[i:j]); err != nil {
+			return errors.Wrap(err, "failed to update last succeeded on attempts")
+		}
 	}
 
 	logResendResult(reqs)
@@ -126,15 +142,20 @@ func (er *EthResender) resendUnconfirmed() error {
 }
 
 // FindEthTxesRequiringResend returns the highest priced attempt for each
-// eth_tx that was last sent before or at the given time
-func FindEthTxesRequiringResend(db *gorm.DB, olderThan time.Time) (attempts []models.EthTxAttempt, err error) {
+// eth_tx that was last sent before or at the given time (up to limit)
+func FindEthTxesRequiringResend(db *gorm.DB, olderThan time.Time, maxInFlightTransactions uint32) (attempts []EthTxAttempt, err error) {
+	var limit null.Uint32
+	if maxInFlightTransactions > 0 {
+		limit = null.Uint32From(maxInFlightTransactions)
+	}
 	err = db.Raw(`
 SELECT DISTINCT ON (eth_tx_id) eth_tx_attempts.*
 FROM eth_tx_attempts
 JOIN eth_txes ON eth_txes.id = eth_tx_attempts.eth_tx_id AND eth_txes.state IN ('unconfirmed', 'confirmed_missing_receipt')
 WHERE eth_tx_attempts.state <> 'in_progress' AND eth_txes.broadcast_at <= ?
 ORDER BY eth_tx_attempts.eth_tx_id ASC, eth_txes.nonce ASC, eth_tx_attempts.gas_price DESC
-`, olderThan).
+LIMIT ?
+`, olderThan, limit).
 		Find(&attempts).Error
 
 	return

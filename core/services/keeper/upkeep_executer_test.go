@@ -4,12 +4,19 @@ import (
 	"context"
 	"math/big"
 	"testing"
+	"time"
+
+	"github.com/smartcontractkit/chainlink/core/services/bulletprooftxmanager"
+	"github.com/smartcontractkit/chainlink/core/services/headtracker"
+	"github.com/smartcontractkit/chainlink/core/utils"
+	"github.com/stretchr/testify/assert"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/onsi/gomega"
 	"github.com/smartcontractkit/chainlink/core/internal/cltest"
 	"github.com/smartcontractkit/chainlink/core/internal/mocks"
-	"github.com/smartcontractkit/chainlink/core/services"
+	bptxmmocks "github.com/smartcontractkit/chainlink/core/services/bulletprooftxmanager/mocks"
+	"github.com/smartcontractkit/chainlink/core/services/job"
 	"github.com/smartcontractkit/chainlink/core/services/keeper"
 	"github.com/smartcontractkit/chainlink/core/store"
 	"github.com/smartcontractkit/chainlink/core/store/models"
@@ -21,21 +28,33 @@ import (
 func setup(t *testing.T) (
 	*store.Store,
 	*mocks.Client,
-	*keeper.UpkeepExecutor,
+	*keeper.UpkeepExecuter,
 	keeper.Registry,
 	keeper.UpkeepRegistration,
-	func(),
+	job.Job,
+	cltest.JobPipelineV2TestHelper,
+	*bptxmmocks.TxManager,
 ) {
-	store, strCleanup := cltest.NewStore(t)
+	config, cfgCleanup := cltest.NewConfig(t)
+	t.Cleanup(cfgCleanup)
+	config.Set("KEEPER_MAXIMUM_GRACE_PERIOD", 0)
+	store, strCleanup := cltest.NewStoreWithConfig(t, config)
+	t.Cleanup(strCleanup)
+	ethKeyStore := cltest.NewKeyStore(t, store.DB).Eth()
 	ethMock := new(mocks.Client)
-	registry, job := cltest.MustInsertKeeperRegistry(t, store)
-	headBroadcaster := services.NewHeadBroadcaster()
-	executor := keeper.NewUpkeepExecutor(job, store.DB, ethMock, headBroadcaster, 0)
+	registry, job := cltest.MustInsertKeeperRegistry(t, store, ethKeyStore)
+	cfg, cleanup := cltest.NewConfig(t)
+	t.Cleanup(cleanup)
+	jpv2 := cltest.NewJobPipelineV2(t, cfg, store.DB, nil, nil)
+	headBroadcaster := headtracker.NewHeadBroadcaster()
+	txm := new(bptxmmocks.TxManager)
+	orm := keeper.NewORM(store.DB, txm, store.Config, bulletprooftxmanager.SendEveryStrategy{})
+	executer := keeper.NewUpkeepExecuter(job, orm, jpv2.Pr, ethMock, headBroadcaster, store.Config)
 	upkeep := cltest.MustInsertUpkeepForRegistry(t, store, registry)
-	err := executor.Start()
+	err := executer.Start()
+	t.Cleanup(func() { executer.Close() })
 	require.NoError(t, err)
-	cleanup := func() { executor.Close(); strCleanup() }
-	return store, ethMock, executor, registry, upkeep, cleanup
+	return store, ethMock, executer, registry, upkeep, job, jpv2, txm
 }
 
 var checkUpkeepResponse = struct {
@@ -52,45 +71,102 @@ var checkUpkeepResponse = struct {
 	LinkEth:        big.NewInt(0), // doesn't matter
 }
 
-func Test_UpkeepExecutor_ErrorsIfStartedTwice(t *testing.T) {
+func Test_UpkeepExecuter_ErrorsIfStartedTwice(t *testing.T) {
 	t.Parallel()
-	_, _, executor, _, _, cleanup := setup(t)
-	defer cleanup()
-
-	err := executor.Start() // already started in setup()
+	_, _, executer, _, _, _, _, _ := setup(t)
+	err := executer.Start() // already started in setup()
 	require.Error(t, err)
 }
 
-func Test_UpkeepExecutor_PerformsUpkeep_Happy(t *testing.T) {
+func Test_UpkeepExecuter_PerformsUpkeep_Happy(t *testing.T) {
 	t.Parallel()
-	store, ethMock, executor, registry, upkeep, cleanup := setup(t)
-	defer cleanup()
-
-	registryMock := cltest.NewContractMockReceiver(t, ethMock, keeper.RegistryABI, registry.ContractAddress.Address())
-	registryMock.MockResponse("checkUpkeep", checkUpkeepResponse)
 
 	t.Run("runs upkeep on triggering block number", func(t *testing.T) {
+		store, ethMock, executer, registry, upkeep, job, jpv2, txm := setup(t)
+
+		gasLimit := upkeep.ExecuteGas + store.Config.KeeperRegistryPerformGasOverhead()
+		ethTxCreated := cltest.NewAwaiter()
+		txm.On("CreateEthTransaction", mock.Anything, mock.Anything, mock.Anything, mock.Anything, gasLimit, nil, mock.Anything).
+			Once().
+			Return(bulletprooftxmanager.EthTx{}, nil).
+			Run(func(mock.Arguments) { ethTxCreated.ItHappened() })
+
+		registryMock := cltest.NewContractMockReceiver(t, ethMock, keeper.RegistryABI, registry.ContractAddress.Address())
+		registryMock.MockResponse("checkUpkeep", checkUpkeepResponse)
+
 		head := models.NewHead(big.NewInt(20), cltest.NewHash(), cltest.NewHash(), 1000)
-		executor.OnNewLongestChain(context.Background(), head)
-		cltest.WaitForCount(t, store, models.EthTx{}, 1)
+		executer.OnNewLongestChain(context.Background(), head)
+		ethTxCreated.AwaitOrFail(t)
 		assertLastRunHeight(t, store, upkeep, 20)
+		runs := cltest.WaitForPipelineComplete(t, 0, job.ID, 1, 0, jpv2.Jrm, time.Second, 100*time.Millisecond)
+		require.Len(t, runs, 1)
+		_, ok := runs[0].Meta.Val.(map[string]interface{})["eth_tx_id"]
+		assert.True(t, ok)
+
+		ethMock.AssertExpectations(t)
+		txm.AssertExpectations(t)
 	})
 
-	t.Run("skips upkeep on non-triggering block number", func(t *testing.T) {
-		head := models.NewHead(big.NewInt(21), cltest.NewHash(), cltest.NewHash(), 1000)
-		executor.OnNewLongestChain(context.Background(), head)
-		cltest.AssertCountStays(t, store, models.EthTx{}, 1)
-	})
+	t.Run("triggers exactly one upkeep if heads are skipped but later heads arrive within range", func(t *testing.T) {
+		store, ethMock, executer, registry, upkeep, job, jpv2, txm := setup(t)
 
-	ethMock.AssertExpectations(t)
+		etxs := []cltest.Awaiter{
+			cltest.NewAwaiter(),
+			cltest.NewAwaiter(),
+		}
+		gasLimit := upkeep.ExecuteGas + store.Config.KeeperRegistryPerformGasOverhead()
+		txm.On("CreateEthTransaction", mock.Anything, mock.Anything, mock.Anything, mock.Anything, gasLimit, nil, mock.Anything).
+			Once().
+			Return(bulletprooftxmanager.EthTx{}, nil).
+			Run(func(mock.Arguments) { etxs[0].ItHappened() })
+
+		registryMock := cltest.NewContractMockReceiver(t, ethMock, keeper.RegistryABI, registry.ContractAddress.Address())
+		registryMock.MockResponse("checkUpkeep", checkUpkeepResponse)
+
+		// turn falls somewhere between 20-39 (blockCountPerTurn=20)
+		// heads 20 thru 35 were skipped (e.g. due to node reboot)
+		head := *cltest.Head(36)
+
+		executer.OnNewLongestChain(context.Background(), head)
+		etxs[0].AwaitOrFail(t)
+		runs := cltest.WaitForPipelineComplete(t, 0, job.ID, 1, 0, jpv2.Jrm, time.Second, 100*time.Millisecond)
+		assertLastRunHeight(t, store, upkeep, 36)
+		require.Len(t, runs, 1)
+		_, ok := runs[0].Meta.Val.(map[string]interface{})["eth_tx_id"]
+		assert.True(t, ok)
+
+		// heads 37, 38 etc do nothing
+		for i := 37; i < 40; i++ {
+			head = *cltest.Head(i)
+			executer.OnNewLongestChain(context.Background(), head)
+		}
+
+		// head 40 triggers a new run
+		head = *cltest.Head(40)
+
+		txm.On("CreateEthTransaction", mock.Anything, mock.Anything, mock.Anything, mock.Anything, gasLimit, nil, mock.Anything).
+			Once().
+			Return(bulletprooftxmanager.EthTx{}, nil).
+			Run(func(mock.Arguments) { etxs[1].ItHappened() })
+
+		executer.OnNewLongestChain(context.Background(), head)
+		etxs[1].AwaitOrFail(t)
+		assertLastRunHeight(t, store, upkeep, 40)
+		runs = cltest.WaitForPipelineComplete(t, 0, job.ID, 2, 0, jpv2.Jrm, time.Second, 100*time.Millisecond)
+		require.Len(t, runs, 2)
+		_, ok = runs[0].Meta.Val.(map[string]interface{})["eth_tx_id"]
+		assert.True(t, ok)
+
+		ethMock.AssertExpectations(t)
+		txm.AssertExpectations(t)
+	})
 }
 
-func Test_UpkeepExecutor_PerformsUpkeep_Error(t *testing.T) {
+func Test_UpkeepExecuter_PerformsUpkeep_Error(t *testing.T) {
 	t.Parallel()
 	g := gomega.NewGomegaWithT(t)
 
-	store, ethMock, executor, registry, _, cleanup := setup(t)
-	defer cleanup()
+	store, ethMock, executer, registry, _, _, _, _ := setup(t)
 
 	wasCalled := atomic.NewBool(false)
 	registryMock := cltest.NewContractMockReceiver(t, ethMock, keeper.RegistryABI, registry.ContractAddress.Address())
@@ -99,9 +175,20 @@ func Test_UpkeepExecutor_PerformsUpkeep_Error(t *testing.T) {
 	})
 
 	head := models.NewHead(big.NewInt(20), cltest.NewHash(), cltest.NewHash(), 1000)
-	executor.OnNewLongestChain(context.TODO(), head)
+	executer.OnNewLongestChain(context.TODO(), head)
 
 	g.Eventually(wasCalled).Should(gomega.Equal(atomic.NewBool(true)))
-	cltest.AssertCountStays(t, store, models.EthTx{}, 0)
+	cltest.AssertCountStays(t, store, bulletprooftxmanager.EthTx{}, 0)
 	ethMock.AssertExpectations(t)
+}
+
+func Test_UpkeepExecuter_ConstructCheckUpkeepCallMsg(t *testing.T) {
+	store, _, executer, registry, upkeep, _, _, _ := setup(t)
+	msg, err := executer.ExportedConstructCheckUpkeepCallMsg(upkeep)
+	require.NoError(t, err)
+	expectedGasLimit := upkeep.ExecuteGas + uint64(registry.CheckGas) + store.Config.KeeperRegistryCheckGasOverhead() + store.Config.KeeperRegistryPerformGasOverhead()
+	require.Equal(t, expectedGasLimit, msg.Gas)
+	require.Equal(t, registry.ContractAddress.Address(), *msg.To)
+	require.Equal(t, utils.ZeroAddress, msg.From)
+	require.Nil(t, msg.Value)
 }

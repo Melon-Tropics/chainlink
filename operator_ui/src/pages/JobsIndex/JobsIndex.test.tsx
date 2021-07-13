@@ -8,6 +8,9 @@ import {
   fluxMonitorJobResource,
   ocrJobResource,
   keeperJobResource,
+  cronJobResource,
+  webJobResource,
+  vrfJobResource,
 } from 'support/factories/jsonApiJobs'
 import { syncFetch } from 'test-helpers/syncFetch'
 import globPath from 'test-helpers/globPath'
@@ -47,6 +50,18 @@ describe('pages/JobsIndex/JobsIndex', () => {
         }),
         keeperJobResource({
           id: '4000000',
+          createdAt: new Date().toISOString(),
+        }),
+        cronJobResource({
+          id: '5000000',
+          createdAt: new Date().toISOString(),
+        }),
+        webJobResource({
+          id: '6000000',
+          createdAt: new Date().toISOString(),
+        }),
+        vrfJobResource({
+          id: '7000000',
           createdAt: new Date().toISOString(),
         }),
       ]),

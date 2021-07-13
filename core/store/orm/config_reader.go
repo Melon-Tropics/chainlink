@@ -18,74 +18,83 @@ type ConfigReader interface {
 	AllowOrigins() string
 	BlockBackfillDepth() uint64
 	BridgeResponseURL() *url.URL
+	CertFile() string
 	ChainID() *big.Int
 	ClientNodeURL() string
+	CreateProductionLogger() *logger.Logger
+	DatabaseMaximumTxDuration() time.Duration
 	DatabaseTimeout() models.Duration
 	DatabaseURL() url.URL
-	DatabaseMaximumTxDuration() time.Duration
-	DefaultMaxHTTPAttempts() uint
+	DefaultHTTPAllowUnrestrictedNetworkAccess() bool
 	DefaultHTTPLimit() int64
 	DefaultHTTPTimeout() models.Duration
-	DefaultHTTPAllowUnrestrictedNetworkAccess() bool
+	DefaultMaxHTTPAttempts() uint
 	Dev() bool
-	FeatureExternalInitiators() bool
-	FeatureFluxMonitor() bool
-	FeatureOffchainReporting() bool
-	MaximumServiceDuration() models.Duration
-	MinimumServiceDuration() models.Duration
 	EnableExperimentalAdapters() bool
 	EthBalanceMonitorBlockDelay() uint16
+	EthFinalityDepth() uint
 	EthGasBumpPercent() uint16
 	EthGasBumpThreshold() uint64
 	EthGasBumpTxDepth() uint16
 	EthGasBumpWei() *big.Int
 	EthGasLimitDefault() uint64
+	EthGasLimitMultiplier() float32
 	EthGasPriceDefault() *big.Int
-	EthMaxGasPriceWei() *big.Int
-	EthNonceAutoSync() bool
-	EthFinalityDepth() uint
-	EthRPCDefaultBatchSize() uint32
 	EthHeadTrackerHistoryDepth() uint
 	EthHeadTrackerMaxBufferSize() uint
+	EthLogBackfillBatchSize() uint32
+	EthMaxGasPriceWei() *big.Int
+	EthNonceAutoSync() bool
+	EthRPCDefaultBatchSize() uint32
+	EthTxReaperInterval() time.Duration
+	EthTxReaperThreshold() time.Duration
 	EthTxResendAfterThreshold() time.Duration
-	SetEthGasPriceDefault(value *big.Int) error
-	EthereumURL() string
 	EthereumSecondaryURLs() []url.URL
-	GasUpdaterBlockDelay() uint16
-	GasUpdaterBlockHistorySize() uint16
-	GasUpdaterTransactionPercentile() uint16
-	JSONConsole() bool
-	LinkContractAddress() string
-	ExplorerURL() *url.URL
+	EthereumURL() string
 	ExplorerAccessKey() string
 	ExplorerSecret() string
-	OperatorContractAddress() common.Address
+	ExplorerURL() *url.URL
+	FeatureExternalInitiators() bool
+	FeatureFluxMonitor() bool
+	FeatureOffchainReporting() bool
+	BlockHistoryEstimatorBlockDelay() uint16
+	BlockHistoryEstimatorBlockHistorySize() uint16
+	BlockHistoryEstimatorTransactionPercentile() uint16
+	InsecureSkipVerify() bool
+	JSONConsole() bool
+	KeeperDefaultTransactionQueueDepth() uint32
+	KeeperRegistryCheckGasOverhead() uint64
+	KeeperRegistryPerformGasOverhead() uint64
+	KeeperRegistrySyncInterval() time.Duration
+	KeeperMinimumRequiredConfirmations() uint64
+	KeeperMaximumGracePeriod() int64
+	KeyFile() string
+	LinkContractAddress() string
 	LogLevel() LogLevel
-	LogToDisk() bool
 	LogSQLStatements() bool
+	LogToDisk() bool
+	MaximumServiceDuration() models.Duration
+	MigrateDatabase() bool
 	MinIncomingConfirmations() uint32
 	MinRequiredOutgoingConfirmations() uint64
 	MinimumContractPayment() *assets.Link
 	MinimumRequestExpiration() uint64
-	MigrateDatabase() bool
+	MinimumServiceDuration() models.Duration
 	OCRTraceLogging() bool
+	OperatorContractAddress() common.Address
 	Port() uint16
 	ReaperExpiration() models.Duration
 	RootDir() string
 	SecureCookies() bool
+	SessionOptions() sessions.Options
+	SessionSecret() ([]byte, error)
 	SessionTimeout() models.Duration
+	SetEthGasPriceDefault(value *big.Int) error
 	TLSCertPath() string
 	TLSHost() string
 	TLSKeyPath() string
 	TLSPort() uint16
 	TLSRedirect() bool
-	KeysDir() string
-	tlsDir() string
-	KeyFile() string
-	CertFile() string
-	CreateProductionLogger() *logger.Logger
-	SessionSecret() ([]byte, error)
-	SessionOptions() sessions.Options
 	TriggerFallbackDBPollInterval() time.Duration
-	EthLogBackfillBatchSize() uint32
+	tlsDir() string
 }

@@ -29,14 +29,16 @@ func (jsc *JobSpecsController) requireImplemented(js models.JobSpec) error {
 			return errors.New("The Flux Monitor feature is disabled by configuration")
 		}
 	}
+	if !cfg.EnableLegacyJobPipeline() {
+		return errors.New("legacy job pipeline is disabled, cannot add job spec")
+	}
 	return nil
 }
 
 // getAndCheckJobSpec(c) returns a validated job spec from c, or errors. The
 // httpStatus return value is only meaningful on error, and in that case
 // reflects the type of failure to be reported back to the client.
-func (jsc *JobSpecsController) getAndCheckJobSpec(
-	c *gin.Context) (js models.JobSpec, httpStatus int, err error) {
+func (jsc *JobSpecsController) getAndCheckJobSpec(c *gin.Context) (js models.JobSpec, httpStatus int, err error) {
 	var jsr models.JobSpecRequest
 	if err := c.ShouldBindJSON(&jsr); err != nil {
 		// TODO(alx): Better parsing and more specific error messages
@@ -47,7 +49,7 @@ func (jsc *JobSpecsController) getAndCheckJobSpec(
 	if err := jsc.requireImplemented(js); err != nil {
 		return models.JobSpec{}, http.StatusNotImplemented, err
 	}
-	if err := services.ValidateJob(js, jsc.App.GetStore()); err != nil {
+	if err := services.ValidateJob(js, jsc.App.GetStore(), jsc.App.GetKeyStore()); err != nil {
 		return models.JobSpec{}, http.StatusBadRequest, err
 	}
 	return js, 0, nil
@@ -83,12 +85,15 @@ func (jsc *JobSpecsController) Index(c *gin.Context, size, page, offset int) {
 // Example:
 //  "<application>/specs"
 func (jsc *JobSpecsController) Create(c *gin.Context) {
+	// NOTE: getAndCheckJobSpec will generate and assign
+	// a new UUID to the spec.
 	js, httpStatus, err := jsc.getAndCheckJobSpec(c)
 	if err != nil {
 		jsonAPIError(c, httpStatus, err)
 		return
 	}
-	if err := jsc.App.GetExternalInitiatorManager().Notify(js, jsc.App.GetStore()); err != nil {
+
+	if err := jsc.App.GetExternalInitiatorManager().Notify(js); err != nil {
 		jsonAPIError(c, http.StatusInternalServerError, err)
 		return
 	}
@@ -117,7 +122,7 @@ func (jsc *JobSpecsController) Create(c *gin.Context) {
 // Example:
 //  "<application>/specs/:SpecID"
 func (jsc *JobSpecsController) Show(c *gin.Context) {
-	id, err := models.NewIDFromString(c.Param("SpecID"))
+	id, err := models.NewJobIDFromString(c.Param("SpecID"))
 	if err != nil {
 		jsonAPIError(c, http.StatusUnprocessableEntity, err)
 		return
@@ -140,7 +145,7 @@ func (jsc *JobSpecsController) Show(c *gin.Context) {
 // Example:
 //  "<application>/specs/:SpecID"
 func (jsc *JobSpecsController) Destroy(c *gin.Context) {
-	id, err := models.NewIDFromString(c.Param("SpecID"))
+	id, err := models.NewJobIDFromString(c.Param("SpecID"))
 	if err != nil {
 		jsonAPIError(c, http.StatusUnprocessableEntity, err)
 		return

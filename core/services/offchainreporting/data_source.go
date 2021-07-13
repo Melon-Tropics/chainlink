@@ -9,6 +9,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/smartcontractkit/chainlink/core/logger"
+	"github.com/smartcontractkit/chainlink/core/services/job"
 	"github.com/smartcontractkit/chainlink/core/services/pipeline"
 	"github.com/smartcontractkit/chainlink/core/utils"
 	ocrtypes "github.com/smartcontractkit/libocr/offchainreporting/types"
@@ -19,6 +20,7 @@ import (
 // ocrtypes.Observation (*big.Int), as expected by the offchain reporting library.
 type dataSource struct {
 	pipelineRunner        pipeline.Runner
+	jobSpec               job.Job
 	spec                  pipeline.Spec
 	ocrLogger             logger.Logger
 	runResults            chan<- pipeline.RunWithResults
@@ -31,27 +33,27 @@ var _ ocrtypes.DataSource = (*dataSource)(nil)
 // Upon context cancellation, its expected that we return any usable values within ObservationGracePeriod.
 func (ds *dataSource) Observe(ctx context.Context) (ocrtypes.Observation, error) {
 	var observation ocrtypes.Observation
-	start := time.Now()
 	md, err := models.MarshalBridgeMetaData(ds.currentBridgeMetadata.LatestAnswer, ds.currentBridgeMetadata.UpdatedAt)
 	if err != nil {
 		logger.Warnw("unable to attach metadata for run", "err", err)
 	}
-	trrs, err := ds.pipelineRunner.ExecuteRun(ctx, ds.spec, pipeline.JSONSerializable{
-		Val: md,
-	}, ds.ocrLogger)
+
+	vars := pipeline.NewVarsFrom(map[string]interface{}{
+		"jobSpec": map[string]interface{}{
+			"databaseID":    ds.jobSpec.ID,
+			"externalJobID": ds.jobSpec.ExternalJobID,
+			"name":          ds.jobSpec.Name.ValueOrZero(),
+		},
+		"jobRun": map[string]interface{}{
+			"meta": md,
+		},
+	})
+
+	run, trrs, err := ds.pipelineRunner.ExecuteRun(ctx, ds.spec, vars, ds.ocrLogger)
 	if err != nil {
 		return observation, errors.Wrapf(err, "error executing run for spec ID %v", ds.spec.ID)
 	}
-	end := time.Now()
-
-	var run pipeline.Run
-	run.PipelineSpecID = ds.spec.ID
-	run.CreatedAt = start
-	run.FinishedAt = &end
-
 	finalResult := trrs.FinalResult()
-	run.Outputs = finalResult.OutputsDB()
-	run.Errors = finalResult.ErrorsDB()
 
 	// Do the database write in a non-blocking fashion
 	// so we can return the observation results immediately.
@@ -79,7 +81,7 @@ func (ds *dataSource) Observe(ctx context.Context) (ocrtypes.Observation, error)
 
 	asDecimal, err := utils.ToDecimal(result.Value)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "cannot convert observation to decimal")
 	}
 	ds.currentBridgeMetadata = models.BridgeMetaData{
 		LatestAnswer: asDecimal.BigInt(),

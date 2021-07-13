@@ -5,6 +5,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/smartcontractkit/chainlink/core/services/offchainreporting"
+	"github.com/smartcontractkit/chainlink/core/services/vrf"
+	"github.com/smartcontractkit/chainlink/core/testdata/testspecs"
+
+	"github.com/smartcontractkit/chainlink/core/services/directrequest"
+
 	gormpostgres "gorm.io/driver/postgres"
 
 	"github.com/pelletier/go-toml"
@@ -15,6 +21,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/smartcontractkit/chainlink/core/internal/cltest"
+	"github.com/smartcontractkit/chainlink/core/internal/cltest/heavyweight"
 	"github.com/smartcontractkit/chainlink/core/internal/mocks"
 	"github.com/smartcontractkit/chainlink/core/services/job"
 	"github.com/smartcontractkit/chainlink/core/services/keeper"
@@ -24,7 +31,7 @@ import (
 
 func TestORM(t *testing.T) {
 	t.Parallel()
-	config, oldORM, cleanupDB := cltest.BootstrapThrowawayORM(t, "services_job_orm", true, true)
+	config, oldORM, cleanupDB := heavyweight.FullTestORM(t, "services_job_orm", true, true)
 	defer cleanupDB()
 	db := oldORM.DB
 
@@ -63,7 +70,7 @@ func TestORM(t *testing.T) {
 	require.NoError(t, err)
 	defer d.Close()
 
-	orm2 := job.NewORM(db2, config.Config, pipeline.NewORM(db2, config, eventBroadcaster), eventBroadcaster, &postgres.NullAdvisoryLocker{})
+	orm2 := job.NewORM(db2, config.Config, pipeline.NewORM(db2), eventBroadcaster, &postgres.NullAdvisoryLocker{})
 	defer orm2.Close()
 
 	t.Run("it correctly returns the unclaimed jobs in the DB", func(t *testing.T) {
@@ -177,18 +184,11 @@ func TestORM(t *testing.T) {
 	})
 
 	t.Run("creates a job with a direct request spec", func(t *testing.T) {
-		spec := job.Job{}
-		tree, err := toml.LoadFile("../../cmd/testdata/direct-request-spec.toml")
+		tree, err := toml.LoadFile("../../testdata/tomlspecs/direct-request-spec.toml")
 		require.NoError(t, err)
-		err = tree.Unmarshal(&spec)
+		jb, err := directrequest.ValidatedDirectRequestSpec(tree.String())
 		require.NoError(t, err)
-
-		var drSpec job.DirectRequestSpec
-		err = tree.Unmarshal(&drSpec)
-		require.NoError(t, err)
-		spec.DirectRequestSpec = &drSpec
-
-		err = orm.CreateJob(context.Background(), &spec, spec.Pipeline)
+		err = orm.CreateJob(context.Background(), &jb, jb.Pipeline)
 		require.NoError(t, err)
 	})
 }
@@ -284,6 +284,8 @@ func TestORM_DeleteJob_DeletesAssociatedRecords(t *testing.T) {
 	store, cleanup := cltest.NewStoreWithConfig(t, config)
 	defer cleanup()
 	db := store.DB
+	keyStore := cltest.NewKeyStore(t, store.DB)
+	keyStore.VRF().Unlock("blah")
 
 	pipelineORM, eventBroadcaster, cleanupORM := cltest.NewPipelineORM(t, config, db)
 	defer cleanupORM()
@@ -298,9 +300,10 @@ func TestORM_DeleteJob_DeletesAssociatedRecords(t *testing.T) {
 
 		key := cltest.MustInsertRandomKey(t, store.DB)
 		address := key.Address.Address()
-		dbSpec := makeOCRJobSpec(t, address)
+		jb, err := offchainreporting.ValidatedOracleSpecToml(config.Config, testspecs.GenerateOCRSpec(testspecs.OCRSpecParams{TransmitterAddress: address.Hex()}).Toml())
+		require.NoError(t, err)
 
-		err := orm.CreateJob(context.Background(), dbSpec, dbSpec.Pipeline)
+		err = orm.CreateJob(context.Background(), &jb, jb.Pipeline)
 		require.NoError(t, err)
 
 		var ocrJob job.Job
@@ -320,7 +323,7 @@ func TestORM_DeleteJob_DeletesAssociatedRecords(t *testing.T) {
 	})
 
 	t.Run("it deletes records for keeper jobs", func(t *testing.T) {
-		registry, keeperJob := cltest.MustInsertKeeperRegistry(t, store)
+		registry, keeperJob := cltest.MustInsertKeeperRegistry(t, store, keyStore.Eth())
 		cltest.MustInsertUpkeepForRegistry(t, store, registry)
 
 		cltest.AssertCount(t, store, job.KeeperSpec{}, 1)
@@ -334,6 +337,22 @@ func TestORM_DeleteJob_DeletesAssociatedRecords(t *testing.T) {
 		cltest.AssertCount(t, store, job.KeeperSpec{}, 0)
 		cltest.AssertCount(t, store, keeper.Registry{}, 0)
 		cltest.AssertCount(t, store, keeper.UpkeepRegistration{}, 0)
+		cltest.AssertCount(t, store, job.Job{}, 0)
+	})
+
+	t.Run("it deletes records for vrf jobs", func(t *testing.T) {
+		pk, err := keyStore.VRF().CreateKey()
+		require.NoError(t, err)
+		jb, err := vrf.ValidatedVRFSpec(testspecs.GenerateVRFSpec(testspecs.VRFSpecParams{PublicKey: pk.String()}).Toml())
+		require.NoError(t, err)
+
+		err = orm.CreateJob(context.Background(), &jb, jb.Pipeline)
+		require.NoError(t, err)
+		ctx, cancel := postgres.DefaultQueryCtx()
+		defer cancel()
+		err = orm.DeleteJob(ctx, jb.ID)
+		require.NoError(t, err)
+		cltest.AssertCount(t, store, job.VRFSpec{}, 0)
 		cltest.AssertCount(t, store, job.Job{}, 0)
 	})
 }

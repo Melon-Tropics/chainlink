@@ -32,6 +32,9 @@ export type JobSpecType =
   | 'fluxmonitor'
   | 'offchainreporting'
   | 'keeper'
+  | 'cron'
+  | 'webhook'
+  | 'vrf'
 
 export type JobV2 = BaseJob & {
   dotDagSource: string
@@ -85,7 +88,7 @@ export type PipelineJobRun = BaseJobRun & {
   }
   status: PipelineJobRunStatus
   taskRuns: PipelineTaskRun[]
-  type: 'Off-chain reporting job run'
+  type: 'Pipeline job run'
 }
 
 export type JobData = {
@@ -93,4 +96,5 @@ export type JobData = {
   jobSpec?: JobSpecResponse['data']
   recentRuns?: PipelineJobRun[] | DirectRequestJobRun[]
   recentRunsCount: number
+  externalJobID?: string
 }

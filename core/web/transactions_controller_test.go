@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/smartcontractkit/chainlink/core/internal/cltest"
-	"github.com/smartcontractkit/chainlink/core/store/models"
+	"github.com/smartcontractkit/chainlink/core/services/bulletprooftxmanager"
 	"github.com/smartcontractkit/chainlink/core/utils"
 	"github.com/smartcontractkit/chainlink/core/web"
 	"github.com/smartcontractkit/chainlink/core/web/presenters"
@@ -25,8 +25,9 @@ func TestTransactionsController_Index_Success(t *testing.T) {
 	require.NoError(t, app.Start())
 
 	store := app.GetStore()
+	ethKeyStore := cltest.NewKeyStore(t, store.DB).Eth()
 	client := app.NewHTTPClient()
-	_, from := cltest.MustAddRandomKeyToKeystore(t, store, 0)
+	_, from := cltest.MustAddRandomKeyToKeystore(t, ethKeyStore, 0)
 
 	cltest.MustInsertConfirmedEthTxWithAttempt(t, store, 0, 1, from)        // tx1
 	tx2 := cltest.MustInsertConfirmedEthTxWithAttempt(t, store, 3, 2, from) // tx2
@@ -35,7 +36,7 @@ func TestTransactionsController_Index_Success(t *testing.T) {
 	// add second tx attempt for tx2
 	blockNum := int64(3)
 	attempt := cltest.NewEthTxAttempt(t, tx2.ID)
-	attempt.State = models.EthTxAttemptBroadcast
+	attempt.State = bulletprooftxmanager.EthTxAttemptBroadcast
 	attempt.GasPrice = *utils.NewBig(big.NewInt(3))
 	attempt.BroadcastBeforeBlockNum = &blockNum
 	require.NoError(t, store.DB.Create(&attempt).Error)
@@ -83,7 +84,7 @@ func TestTransactionsController_Show_Success(t *testing.T) {
 	require.NoError(t, app.Start())
 	store := app.GetStore()
 	client := app.NewHTTPClient()
-	_, from := cltest.MustAddRandomKeyToKeystore(t, store, 0)
+	_, from := cltest.MustAddRandomKeyToKeystore(t, app.KeyStore.Eth(), 0)
 
 	tx := cltest.MustInsertUnconfirmedEthTxWithBroadcastAttempt(t, store, 1, from)
 	require.Len(t, tx.EthTxAttempts, 1)
@@ -117,7 +118,7 @@ func TestTransactionsController_Show_NotFound(t *testing.T) {
 	require.NoError(t, app.Start())
 	store := app.GetStore()
 	client := app.NewHTTPClient()
-	_, from := cltest.MustAddRandomKeyToKeystore(t, store, 0)
+	_, from := cltest.MustAddRandomKeyToKeystore(t, app.KeyStore.Eth(), 0)
 	tx := cltest.MustInsertUnconfirmedEthTxWithBroadcastAttempt(t, store, 1, from)
 	require.Len(t, tx.EthTxAttempts, 1)
 	attempt := tx.EthTxAttempts[0]
